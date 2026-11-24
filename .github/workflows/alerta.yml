@@ -1,0 +1,100 @@
+name: Alerta Cupons Shopee
+
+on:
+  workflow_dispatch:
+    inputs:
+      modo_teste:
+        description: 'Forcar notificacao de teste?'
+        required: false
+        default: 'sim'
+      desconto_minimo_reais:
+        description: 'Filtrar descontos a partir de R$ (0 = todos)'
+        required: false
+        default: '0'
+
+jobs:
+  radar:
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    env:
+      TOPICO: ${{ secrets.NTFY_TOPIC }}
+      MODO_TESTE: ${{ inputs.modo_teste }}
+      MIN_REAIS: ${{ inputs.desconto_minimo_reais }}
+    steps:
+      - name: Checar cupons e alertar
+        run: |
+          python3 - << 'EOF'
+          import os, re, json, html, urllib.request
+
+          topico = os.environ.get("TOPICO", "").strip()
+          if not topico:
+              raise SystemExit("Erro: Secret NTFY_TOPIC nao configurado.")
+
+          forcar_teste = (os.environ.get("MODO_TESTE", "nao").lower() == "sim")
+          min_reais = int(os.environ.get("MIN_REAIS", "0") or "0")
+
+          # 1. Historico das ultimas 24h direto do ntfy (evita repeticao)
+          ja_enviados = ""
+          try:
+              req_hist = urllib.request.Request(f"https://ntfy.sh{topico}/json?poll=1&since=24h")
+              with urllib.request.urlopen(req_hist, timeout=10) as r:
+                  for linha in r.read().decode("utf-8", "ignore").splitlines():
+                      if linha.strip():
+                          ja_enviados += json.loads(linha).get("message", "") + "\n"
+          except Exception:
+              pass
+
+          # 2. Varre fontes agregadoras de cupons ativos da Shopee Brasil
+          fontes = [
+              "https://pelando.com.br",
+              "https://cuponomia.com.br",
+              "https://meliuz.com.br"
+          ]
+          headers = {
+              "User-Agent": "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 Chrome/126.0.0.0 Mobile Safari/537.36",
+              "Accept-Language": "pt-BR,pt;q=0.9"
+          }
+
+          encontrados = []
+          padrao = re.compile(r">([^<]{12,95}(?:R\$\s?\d+|\d+%\s?OFF|FRETE\s?GR[ÁA]TIS)[^<]{0,45})<", re.I)
+
+          for url in fontes:
+              try:
+                  req = urllib.request.Request(url, headers=headers)
+                  with urllib.request.urlopen(req, timeout=15) as r:
+                      conteudo = html.unescape(r.read().decode("utf-8", "ignore"))
+                      for texto in padrao.findall(conteudo):
+                          limpo = re.sub(r"\s+", " ", texto).strip()
+                          if len(limpo) < 12 or limpo in ja_enviados or limpo in encontrados:
+                              continue
+                          # Aplica filtro opcional de valor minimo em R$
+                          if min_reais > 0:
+                              m_val = re.search(r"R\$\s?(\d+)", limpo, re.I)
+                              if m_val and int(m_val.group(1)) < min_reais:
+                                  continue
+                          encontrados.append(limpo)
+              except Exception:
+                  pass
+
+          novos = encontrados[:6]
+
+          # 3. Envia push pro Android apenas se houver novidade (ou teste manual)
+          if novos or forcar_teste:
+              corpo = "• " + "\n• ".join(novos) if novos else "• Teste manual OK! Pontualidade externa pronta."
+              titulo = f"{len(novos)} Novo(s) Cupom(ns) Shopee!" if novos else "Radar Shopee Pronto!"
+
+              disparo = urllib.request.Request(
+                  f"https://ntfy.sh{topico}",
+                  data=corpo.encode("utf-8"),
+                  headers={
+                      "Title": titulo,
+                      "Click": "https://shopee.com.br",
+                      "Tags": "ticket,zap"
+                  },
+                  method="POST"
+              )
+              urllib.request.urlopen(disparo, timeout=10)
+              print(f"Notificacao enviada ({len(novos)} novos).")
+          else:
+              print("Sem cupons ineditos nesta virada de hora.")
+          EOF
