@@ -16,6 +16,11 @@ on:
         required: false
         default: '0'
         type: string
+      canais_telegram:
+        description: 'Canais publicos Telegram separados por virgula (opcional)'
+        required: false
+        default: ''
+        type: string
 
 permissions: {}
 
@@ -26,9 +31,9 @@ concurrency:
 jobs:
   verificar_cupons:
     runs-on: ubuntu-latest
-    timeout-minutes: 4
+    timeout-minutes: 3
     steps:
-      - name: Restaurar memoria de cupons e URL ativa
+      - name: Restaurar memoria de cupons ja enviados
         uses: actions/cache@v4
         with:
           path: ~/.cache/shopee-monitor
@@ -36,33 +41,28 @@ jobs:
           restore-keys: |
             shopee-state-
 
-      - name: Preparar Playwright
-        run: |
-          python3 -m pip install -q playwright
-          if ! command -v google-chrome >/dev/null 2>&1; then
-            python3 -m playwright install chromium
-          fi
-
-      - name: Monitorar Shopee oficial e notificar via ntfy
+      - name: Buscar cupons novos sem cookies e notificar via ntfy
         env:
           NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
-          SHOPEE_COOKIES: ${{ secrets.SHOPEE_COOKIES }}
+          TELEGRAM_CHANNELS_VAR: ${{ vars.TELEGRAM_CHANNELS }}
+          TELEGRAM_CHANNELS_INPUT: ${{ inputs.canais_telegram }}
           MODO_TESTE: ${{ inputs.modo_teste }}
           DESCONTO_MIN: ${{ inputs.desconto_minimo_reais }}
         run: |
           python3 - << 'EOF'
+          import gzip
+          import html
           import json
           import os
           import re
-          import shutil
           import time
+          import urllib.error
+          import urllib.parse
           import urllib.request
           from pathlib import Path
-          from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 
           topico_bruto = os.environ.get("NTFY_TOPIC", "").strip()
           topico = re.sub(r"^https?://ntfy\.sh/", "", topico_bruto, flags=re.IGNORECASE).strip("/")
-          cookies_brutos = os.environ.get("SHOPEE_COOKIES", "").strip()
           modo_teste = (os.environ.get("MODO_TESTE") or "nao").strip().lower()
           desconto_str = (os.environ.get("DESCONTO_MIN") or "0").strip()
 
@@ -74,13 +74,7 @@ jobs:
           if not topico or "/" in topico or " " in topico:
               raise SystemExit("ERRO: Secret NTFY_TOPIC vazio ou invalido.")
 
-          SEED_URL = "https://shopee.com.br/m/cupom-de-desconto"
-          HUBS_OFICIAIS = [
-              "https://shopee.com.br/m/cupom-de-desconto",
-              "https://shopee.com.br/m/cupons-diarios",
-              "https://shopee.com.br/m/frete-gratis",
-              "https://shopee.com.br/",
-          ]
+          URL_SHOPEE_PADRAO = "https://shopee.com.br/m/cupom-de-desconto"
 
           cache_dir = Path.home() / ".cache" / "shopee-monitor"
           cache_dir.mkdir(parents=True, exist_ok=True)
@@ -92,67 +86,78 @@ jobs:
                       return json.loads(state_file.read_text(encoding="utf-8"))
                   except json.JSONDecodeError:
                       pass
-              return {
-                  "active_url": SEED_URL,
-                  "seen_vouchers": {},
-                  "last_block_alert": 0,
-                  "initialized": False,
-              }
+              return {"seen_codes": {}, "initialized": False}
 
           def salvar_estado(estado):
-              vistos = estado.get("seen_vouchers", {})
+              vistos = estado.get("seen_codes", {})
               if len(vistos) > 2500:
                   ordenados = sorted(vistos.items(), key=lambda kv: kv[1], reverse=True)[:2500]
-                  estado["seen_vouchers"] = dict(ordenados)
+                  estado["seen_codes"] = dict(ordenados)
               state_file.write_text(json.dumps(estado, ensure_ascii=False, indent=2), encoding="utf-8")
 
-          def parse_cookies_playwright(raw_str):
-              if not raw_str:
-                  return []
-              cookies_pw = []
-              if raw_str.startswith("["):
-                  try:
-                      lista = json.loads(raw_str)
-                      for item in lista:
-                          if not isinstance(item, dict):
-                              continue
-                          nome = str(item.get("name") or "").strip()
-                          valor = str(item.get("value") or "")
-                          if not nome:
-                              continue
-                          cookies_pw.append({
-                              "name": nome,
-                              "value": valor,
-                              "domain": str(item.get("domain") or ".shopee.com.br").strip(),
-                              "path": str(item.get("path") or "/"),
-                              "secure": True,
-                              "httpOnly": bool(item.get("httpOnly", False)),
-                              "sameSite": "Lax",
-                          })
-                      return cookies_pw
-                  except json.JSONDecodeError:
-                      pass
+          headers_nav = {
+              "User-Agent": (
+                  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                  "AppleWebKit/537.36 (KHTML, like Gecko) "
+                  "Chrome/131.0.0.0 Safari/537.36"
+              ),
+              "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+              "Accept-Language": "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7",
+              "Accept-Encoding": "gzip, identity",
+              "Cache-Control": "no-cache",
+          }
 
-              raw_clean = re.sub(r"^cookie\s*:\s*", "", raw_str, flags=re.IGNORECASE)
-              for parte in raw_clean.split(";"):
-                  parte = parte.strip()
-                  if "=" not in parte:
-                      continue
-                  nome, valor = parte.split("=", 1)
-                  nome = nome.strip()
-                  if not nome:
-                      continue
-                  cookies_pw.append({
-                      "name": nome,
-                      "value": valor.strip(),
-                      "domain": ".shopee.com.br",
-                      "path": "/",
-                      "secure": True,
-                      "sameSite": "Lax",
-                  })
-              return cookies_pw
+          def baixar_texto(url, headers=None, timeout=20):
+              req = urllib.request.Request(url, headers=headers or headers_nav)
+              with urllib.request.urlopen(req, timeout=timeout) as resp:
+                  bruto = resp.read()
+                  if resp.headers.get("Content-Encoding", "").lower() == "gzip":
+                      bruto = gzip.decompress(bruto)
+                  return resp.status, bruto.decode("utf-8", errors="ignore")
 
-          def enviar_ntfy(titulo, mensagem, click_url, prioridade=4, tags=None):
+          def parse_valor_brl(texto_num):
+              s = texto_num.strip()
+              if "," in s and "." in s:
+                  s = s.replace(".", "").replace(",", ".")
+              elif "," in s:
+                  s = s.replace(",", ".")
+              elif re.fullmatch(r"\d{1,3}(?:\.\d{3})+", s):
+                  s = s.replace(".", "")
+              try:
+                  return float(s)
+              except ValueError:
+                  return 0.0
+
+          def extrair_desconto_brl(trecho):
+              if not trecho:
+                  return 0.0
+              padroes_diretos = [
+                  r"R\$\s*(\d+(?:[.,]\d{1,3})*)\s*(?:off|de\s+desconto|em\s+desconto|desconto)\b",
+                  r"(?:desconto\s+de|ganhe|economize|at[eé]|cupom\s+de)\s+R\$\s*(\d+(?:[.,]\d{1,3})*)",
+              ]
+              diretos = []
+              for pad in padroes_diretos:
+                  for m in re.finditer(pad, trecho, flags=re.IGNORECASE):
+                      v = parse_valor_brl(m.group(1))
+                      if v > 0:
+                          diretos.append(v)
+              if diretos:
+                  return max(diretos)
+
+              trecho_limpo = re.sub(
+                  r"(?:acima\s+de|a\s+partir\s+de|m[ií]nim[oa]\s*(?:de)?|compras?\s+de)\s*R\$\s*\d+(?:[.,]\d{1,3})*",
+                  " ",
+                  trecho,
+                  flags=re.IGNORECASE,
+              )
+              restantes = [
+                  parse_valor_brl(v)
+                  for v in re.findall(r"R\$\s*(\d+(?:[.,]\d{1,3})*)", trecho_limpo)
+              ]
+              restantes = [v for v in restantes if v > 0]
+              return min(restantes) if restantes else 0.0
+
+          def enviar_ntfy(titulo, mensagem, click_url=URL_SHOPEE_PADRAO, prioridade=4, tags=None):
               payload = {
                   "topic": topico,
                   "title": titulo,
@@ -166,329 +171,262 @@ jobs:
                   data=json.dumps(payload).encode("utf-8"),
                   headers={
                       "Content-Type": "application/json; charset=utf-8",
-                      "User-Agent": "github-actions-shopee-live/3.0",
+                      "User-Agent": "github-actions-shopee-fast/4.0",
                   },
                   method="POST",
               )
               with urllib.request.urlopen(req, timeout=15) as r:
-                  print(f"[ntfy] Notificacao enviada (HTTP {r.status}): {titulo}")
+                  print(f"[ntfy] Enviado (HTTP {r.status}): {titulo}")
 
-          def normalizar_valor(valor):
-              if valor is None or isinstance(valor, bool):
-                  return 0.0
-              if isinstance(valor, (int, float)):
-                  v = float(valor)
-                  return round(v / 100000.0, 2) if v >= 10000 else round(v, 2)
-              if isinstance(valor, str):
-                  m = re.search(r"(\d+(?:[.,]\d{1,2})?)", valor)
-                  if m:
-                      return float(m.group(1).replace(",", "."))
-              return 0.0
+          ignorar = {
+              "SHOPEE", "SHOPEEBR", "CUPOM", "CUPONS", "COUPON", "COUPONS", "VOUCHER",
+              "DESCONTO", "DESCONTOS", "DISCOUNT", "GRATIS", "FRETE", "BRASIL", "BRAZIL",
+              "OFERTA", "OFERTAS", "OFFER", "OFFERS", "PROMO", "PROMOCAO", "CASHBACK",
+              "MELIUZ", "PELANDO", "CUPONOMIA", "HTML", "HTTPS", "SCRIPT", "STYLE",
+              "WINDOW", "DOCUMENT", "FUNCTION", "RETURN", "TRUE", "FALSE", "NULL",
+              "UNDEFINED", "CLASS", "BUTTON", "HEADER", "FOOTER", "COMPRA", "COMPRAS",
+              "LOJAS", "TODOS", "TODAS", "ATIVO", "ATIVOS", "ACTIVE", "EXPIRADO",
+              "EXPIRED", "VERIFICADO", "VERIFIED", "PEGAR", "COPIAR", "SUCCESS",
+              "ERROR", "DEFAULT", "PRIMARY", "SECONDARY", "ENABLED", "DISABLED",
+              "POPULAR", "FEATURED", "PERCENT", "PUBLIC", "PRIVATE", "ONLINE",
+              "MOBILE", "DESKTOP", "TELEGRAM", "RESGATE", "CORRE", "APROVEITE",
+          }
 
-          def extrair_cupons(obj, coletados, agora_ts):
-              if isinstance(obj, list):
-                  for item in obj:
-                      extrair_cupons(item, coletados, agora_ts)
-                  return
-              if not isinstance(obj, dict):
-                  return
+          def validar_codigo(codigo_bruto, exigir_digito=False):
+              codigo = codigo_bruto.upper().strip()
+              if not re.fullmatch(r"[A-Z0-9][A-Z0-9_-]{3,18}[A-Z0-9]", codigo):
+                  return None
+              if codigo in ignorar or codigo.isdigit():
+                  return None
+              if not any(c.isalpha() for c in codigo):
+                  return None
+              if exigir_digito and not any(c.isdigit() for c in codigo):
+                  return None
+              return codigo
 
-              chaves = set(obj.keys())
-              sinais = {
-                  "voucher_code", "promotionid", "promotion_id", "voucher_identifier",
-                  "discount_value", "discount_percentage", "min_spend", "percentage_claimed",
-                  "voucher_basic_info", "reward_cap", "reward_percentage",
-              }
-
-              codigo = str(obj.get("voucher_code") or "").strip().upper()
-              tem_codigo_valido = bool(re.fullmatch(r"[A-Z0-9_-]{4,25}", codigo))
-
-              if len(chaves & sinais) >= 2 or tem_codigo_valido:
-                  promo_id = obj.get("promotionid") or obj.get("promotion_id")
-                  if not promo_id and isinstance(obj.get("voucher_identifier"), dict):
-                      promo_id = obj["voucher_identifier"].get("promotion_id")
-
-                  pct_usado = obj.get("percentage_claimed")
-                  end_time = obj.get("end_time") or obj.get("valid_to") or 0
-
-                  esgotado = isinstance(pct_usado, (int, float)) and pct_usado >= 100
-                  expirado = isinstance(end_time, (int, float)) and end_time > 0 and end_time < agora_ts
-
-                  if (promo_id or tem_codigo_valido) and not esgotado and not expirado:
-                      desc_reais = normalizar_valor(
-                          obj.get("discount_value") or obj.get("reward_cap") or obj.get("max_value")
-                      )
-                      desc_pct = obj.get("discount_percentage") or obj.get("reward_percentage") or 0
-                      min_spend = normalizar_valor(obj.get("min_spend"))
-
-                      ui_info = obj.get("ui_info") if isinstance(obj.get("ui_info"), dict) else {}
-                      titulo = (
-                          obj.get("title")
-                          or obj.get("customised_title")
-                          or ui_info.get("title")
-                          or obj.get("description")
-                          or ""
-                      )
-                      titulo = re.sub(r"\s+", " ", str(titulo)).strip()
-
-                      chave = f"PROMO:{promo_id}" if promo_id else f"CODE:{codigo}"
-                      coletados[chave] = {
-                          "id": str(promo_id or ""),
-                          "codigo": codigo if tem_codigo_valido else "",
-                          "titulo": titulo[:90],
-                          "desconto_reais": desc_reais,
-                          "desconto_pct": int(desc_pct) if isinstance(desc_pct, (int, float)) else 0,
-                          "min_spend": min_spend,
-                          "pct_usado": int(pct_usado) if isinstance(pct_usado, (int, float)) else None,
-                      }
-
-              for v in obj.values():
-                  if isinstance(v, (dict, list)):
-                      extrair_cupons(v, coletados, agora_ts)
-
-          def inspecionar_pagina(page, url):
-              cupons = {}
-              bloqueio = None
-              agora_ts = int(time.time())
-
-              def on_response(resp):
-                  nonlocal bloqueio
-                  if "shopee.com.br/" not in resp.url.lower():
-                      return
-                  if "json" not in (resp.headers.get("content-type") or "").lower():
-                      return
-                  try:
-                      dados = resp.json()
-                  except Exception:
-                      return
-                  if isinstance(dados, dict) and dados.get("error") in (90309999, 90309998):
-                      bloqueio = f"Bloqueio anti-bot Shopee ({dados.get('error')})"
-                      return
-                  extrair_cupons(dados, cupons, agora_ts)
-
-              page.on("response", on_response)
-              try:
-                  resp_nav = page.goto(url, wait_until="domcontentloaded", timeout=35000)
-                  status = resp_nav.status if resp_nav else 0
-                  page.wait_for_timeout(4500)
-
-                  for _ in range(4):
-                      page.mouse.wheel(0, 950)
-                      page.wait_for_timeout(1200)
-
-                  # Tambem varre JSON embutido direto no HTML da pagina
-                  try:
-                      scripts_json = page.eval_on_selector_all(
-                          'script[type="application/json"]',
-                          "els => els.map(e => e.textContent)",
-                      )
-                      for raw_json in scripts_json:
-                          if raw_json and raw_json.strip().startswith(("{", "[")):
-                              try:
-                                  extrair_cupons(json.loads(raw_json), cupons, agora_ts)
-                              except json.JSONDecodeError:
-                                  pass
-                  except Exception:
-                      pass
-
-                  url_final = page.url or url
-                  if any(k in url_final.lower() for k in ("/buyer/login", "/verify/captcha", "/verify/traffic")):
-                      bloqueio = f"Redirecionado para login/captcha ({url_final})"
-
-                  return {
-                      "status": status,
-                      "final_url": url_final,
-                      "cupons": cupons,
-                      "bloqueio": bloqueio,
-                  }
-              except PlaywrightTimeoutError:
-                  return {
-                      "status": 0,
-                      "final_url": page.url or url,
-                      "cupons": cupons,
-                      "bloqueio": "Timeout ao carregar Shopee",
-                  }
-              finally:
-                  page.remove_listener("response", on_response)
-
-          def descobrir_rota_ativa(page):
-              candidatos = list(HUBS_OFICIAIS)
-              for rota in candidatos:
-                  print(f"[auto-url] Testando rota oficial: {rota}")
-                  res = inspecionar_pagina(page, rota)
-                  if res["bloqueio"]:
-                      return None, res
-                  if res["cupons"] and res["status"] < 400:
-                      return res["final_url"], res
-
-                  try:
-                      links = page.eval_on_selector_all(
-                          'a[href*="/m/"]',
-                          "els => [...new Set(els.map(e => e.href))]",
-                      )
-                  except Exception:
-                      links = []
-
-                  for link in links:
-                      if any(k in link.lower() for k in ("cupom", "cupons", "voucher", "desconto", "frete")):
-                          if link not in candidatos and len(candidatos) < 12:
-                              candidatos.append(link)
-              return None, None
-
-          def formatar_cupom(c):
-              ident = c["codigo"] if c["codigo"] else f"Cupom Direto #{c['id']}"
-              detalhes = []
-              if c["desconto_reais"] > 0:
-                  detalhes.append(f"R$ {c['desconto_reais']:g} OFF")
-              if c["desconto_pct"] > 0:
-                  detalhes.append(f"{c['desconto_pct']}% OFF")
-              if c["min_spend"] > 0:
-                  detalhes.append(f"min. R$ {c['min_spend']:g}")
-              if c["pct_usado"] is not None:
-                  detalhes.append(f"{c['pct_usado']}% usado")
-              info = f" ({', '.join(detalhes)})" if detalhes else ""
-              titulo = f" — {c['titulo']}" if c["titulo"] and c["titulo"].upper() != ident else ""
-              return f"- {ident}{info}{titulo}"
-
+          # 1. Carregar memoria (cache GitHub + backup das ultimas 24h do ntfy)
           estado = carregar_estado()
-          cookies_lista = parse_cookies_playwright(cookies_brutos)
-          print(f"[sessao] Cookies carregados: {len(cookies_lista)}")
+          ja_enviados = set(estado.get("seen_codes", {}).keys())
 
-          chrome_bin = shutil.which("google-chrome") or shutil.which("google-chrome-stable")
-
-          with sync_playwright() as p:
-              launch_kwargs = {
-                  "headless": True,
-                  "args": [
-                      "--headless=new",
-                      "--no-sandbox",
-                      "--disable-dev-shm-usage",
-                      "--disable-blink-features=AutomationControlled",
-                  ],
-              }
-              if chrome_bin:
-                  launch_kwargs["executable_path"] = chrome_bin
-
-              browser = p.chromium.launch(**launch_kwargs)
-              context = browser.new_context(
-                  locale="pt-BR",
-                  timezone_id="America/Sao_Paulo",
-                  viewport={"width": 1280, "height": 900},
-                  user_agent=(
-                      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                      "AppleWebKit/537.36 (KHTML, like Gecko) "
-                      "Chrome/131.0.0.0 Safari/537.36"
-                  ),
-                  extra_http_headers={
-                      "Accept-Language": "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7",
-                      "sec-ch-ua": '"Chromium";v="131", "Not_A Brand";v="24"',
-                      "sec-ch-ua-mobile": "?0",
-                      "sec-ch-ua-platform": '"Windows"',
-                  },
+          try:
+              _, corpo_hist = baixar_texto(
+                  f"https://ntfy.sh/{urllib.parse.quote(topico)}/json?poll=1&since=24h",
+                  headers={"User-Agent": "github-actions-shopee-fast/4.0"},
+                  timeout=15,
               )
-
-              context.add_init_script("""
-                  Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-                  Object.defineProperty(navigator, 'languages', { get: () => ['pt-BR', 'pt', 'en-US', 'en'] });
-                  window.chrome = { runtime: {} };
-              """)
-
-              if cookies_lista:
-                  context.add_cookies(cookies_lista)
-
-              page = context.new_page()
-
-              try:
-                  res = inspecionar_pagina(page, SEED_URL)
-                  url_ativa = estado.get("active_url") or SEED_URL
-
-                  if not res["bloqueio"] and "shopee.com.br" in res["final_url"]:
-                      if res["final_url"].rstrip("/") != url_ativa.rstrip("/"):
-                          print(f"[auto-url] Novo destino oficial detectado: {res['final_url']}")
-                          url_ativa = res["final_url"]
-                          estado["active_url"] = url_ativa
-
-                  if not res["bloqueio"] and (not res["cupons"] or res["status"] >= 400):
-                      if url_ativa != SEED_URL and url_ativa != res["final_url"]:
-                          res_ativa = inspecionar_pagina(page, url_ativa)
-                          if res_ativa["cupons"] and not res_ativa["bloqueio"]:
-                              res = res_ativa
-
-                      if not res["cupons"] and not res["bloqueio"]:
-                          nova_url, res_nova = descobrir_rota_ativa(page)
-                          if nova_url and res_nova:
-                              url_ativa = nova_url
-                              estado["active_url"] = nova_url
-                              res = res_nova
-                          elif res_nova and res_nova.get("bloqueio"):
-                              res = res_nova
-
-                  if res["bloqueio"]:
-                      print(f"[aviso] {res['bloqueio']}")
-                      agora = time.time()
-                      if modo_teste == "sim" or (agora - estado.get("last_block_alert", 0) > 21600):
-                          enviar_ntfy(
-                              "Shopee bloqueou acesso do GitHub",
-                              f"Motivo: {res['bloqueio']}\nAdicione o Secret SHOPEE_COOKIES para liberar o acesso.",
-                              click_url=url_ativa,
-                              prioridade=3,
-                              tags=["warning"],
-                          )
-                          estado["last_block_alert"] = agora
-                      salvar_estado(estado)
-                      raise SystemExit(0)
-
-                  cupons = res["cupons"]
-                  novos = []
-                  agora_ts = int(time.time())
-
-                  for chave, dados in cupons.items():
-                      if desconto_min > 0 and dados["desconto_reais"] < desconto_min:
+              for linha in corpo_hist.splitlines():
+                  if not linha.strip():
+                      continue
+                  try:
+                      ev = json.loads(linha)
+                      if ev.get("event") != "message":
                           continue
-                      if chave not in estado["seen_vouchers"]:
-                          novos.append((chave, dados))
+                      for cod in re.findall(r"(?m)^-\s+([A-Z0-9][A-Z0-9_-]{3,19})\b", ev.get("message", "").upper()):
+                          ja_enviados.add(cod)
+                  except json.JSONDecodeError:
+                      continue
+          except Exception as e:
+              print(f"[aviso] Historico ntfy indisponivel: {e}")
 
-                  if novos:
-                      for chave, _ in novos:
-                          estado["seen_vouchers"][chave] = agora_ts
+          encontrados = {}
+          sucessos = 0
+          falhas = []
 
-                      if not estado.get("initialized"):
-                          estado["initialized"] = True
-                          salvar_estado(estado)
-                          linhas = "\n".join(formatar_cupom(d) for _, d in novos[:12])
-                          enviar_ntfy(
-                              f"Monitor Shopee Conectado ({len(novos)} cupons atuais)",
-                              f"Rota oficial ativa: {url_ativa}\n\nCupons ja disponiveis agora:\n{linhas}\n\n"
-                              "Proximos alertas serao enviados apenas quando surgir um cupom novo.",
-                              click_url=url_ativa,
-                              prioridade=3,
-                              tags=["white_check_mark", "shopping"],
-                          )
-                      else:
-                          salvar_estado(estado)
-                          linhas = "\n".join(formatar_cupom(d) for _, d in novos[:12])
-                          enviar_ntfy(
-                              f"NOVO Cupom Oficial Shopee ({len(novos)})!",
-                              f"Detectado agora no site oficial da Shopee:\n{linhas}\n\nToque para abrir e resgatar.",
-                              click_url=url_ativa,
-                              prioridade=5,
-                              tags=["rotating_light", "fire", "shopping"],
-                          )
-                  else:
-                      if not estado.get("initialized") and cupons:
-                          estado["initialized"] = True
-                      salvar_estado(estado)
-                      print(f"[ok] {len(cupons)} cupons oficiais verificados. Nenhum cupom novo.")
-                      if modo_teste == "sim":
-                          enviar_ntfy(
-                              "Teste Shopee Oficial OK",
-                              f"Conexao e leitura oficial funcionando.\nRota ativa: {url_ativa}\n"
-                              f"Cupons ativos na pagina: {len(cupons)} (nenhum inedito neste ciclo).",
-                              click_url=url_ativa,
-                              prioridade=3,
-                              tags=["white_check_mark"],
-                          )
-              finally:
-                  context.close()
-                  browser.close()
+          def registrar_cupom(codigo, valor, fonte, link_direto=URL_SHOPEE_PADRAO):
+              if desconto_min > 0 and valor < desconto_min:
+                  return
+              if codigo in ja_enviados:
+                  return
+              if codigo not in encontrados or valor > encontrados[codigo]["valor"]:
+                  encontrados[codigo] = {
+                      "valor": valor,
+                      "fonte": fonte,
+                      "link": link_direto or URL_SHOPEE_PADRAO,
+                  }
+
+          # 2. Fonte A: Canais publicos do Telegram (tempo real, sem bloqueio)
+          canais_brutos = os.environ.get("TELEGRAM_CHANNELS_INPUT") or os.environ.get("TELEGRAM_CHANNELS_VAR") or ""
+          canais_tg = []
+          for item in re.split(r"[,;\s]+", canais_brutos.strip()):
+              limpo = re.sub(r"^https?://t\.me/(?:s/)?", "", item, flags=re.IGNORECASE).lstrip("@").strip("/")
+              if re.fullmatch(r"[A-Za-z0-9_]{4,40}", limpo):
+                  canais_tg.append(limpo)
+
+          for canal in canais_tg:
+              url_tg = f"https://t.me/s/{canal}"
+              try:
+                  status, bruto = baixar_texto(url_tg, timeout=20)
+                  sucessos += 1
+                  blocos = re.findall(
+                      r'<div class="tgme_widget_message_text[^"]*"[^>]*>(.*?)</div>',
+                      bruto,
+                      flags=re.IGNORECASE | re.DOTALL,
+                  )
+                  print(f"[Telegram @{canal}] HTTP {status} | {len(blocos)} mensagens recentes.")
+
+                  for bloco_html in blocos[-25:]:
+                      texto_limpo = html.unescape(re.sub(r"<[^>]+>", " ", bloco_html))
+                      if not re.search(r"shopee|shp\.ee", texto_limpo, flags=re.IGNORECASE):
+                          continue
+
+                      links_shopee = re.findall(
+                          r'https?://(?:br\.shp\.ee|s\.shopee\.com\.br|shopee\.com\.br)[^\s"\'<>]+',
+                          html.unescape(bloco_html),
+                          flags=re.IGNORECASE,
+                      )
+                      link_msg = links_shopee[0] if links_shopee else URL_SHOPEE_PADRAO
+                      valor_desc = extrair_desconto_brl(texto_limpo)
+
+                      # Prioridade 1: codigos dentro de <code>...</code> (padrao de bots de cupom no Telegram)
+                      cods_tag = re.findall(r"<code[^>]*>\s*([A-Za-z0-9_-]{4,20})\s*</code>", bloco_html, flags=re.IGNORECASE)
+                      for c in cods_tag:
+                          cod = validar_codigo(c, exigir_digito=False)
+                          if cod:
+                              registrar_cupom(cod, valor_desc, f"Telegram @{canal}", link_msg)
+
+                      # Prioridade 2: mencoes explicitas a cupom no texto
+                      for m in re.finditer(
+                          r"(?:cupom|c[oó]digo)\s*[:\-]?\s*([A-Z0-9_-]{5,20})\b",
+                          texto_limpo,
+                          flags=re.IGNORECASE,
+                      ):
+                          cod = validar_codigo(m.group(1), exigir_digito=True)
+                          if cod:
+                              registrar_cupom(cod, valor_desc, f"Telegram @{canal}", link_msg)
+              except Exception as e:
+                  msg = f"Telegram @{canal}: {e}"
+                  print(f"[erro] {msg}")
+                  falhas.append(msg)
+
+          # 3. Fonte B: Agregadores diretos (Cuponomia, Pelando, Meliuz)
+          fontes_web = {
+              "Cuponomia": "https://www.cuponomia.com.br/desconto/shopee",
+              "Pelando": "https://www.pelando.com.br/cupons-de-descontos/shopee",
+              "Meliuz": "https://www.meliuz.com.br/desconto/cupom-shopee",
+          }
+
+          chaves_alta = {"couponcode", "vouchercode", "promocode", "discountcode", "cupom"}
+          chaves_ctx = {"title", "description", "discount", "store", "merchant", "coupon", "voucher", "offer"}
+
+          def extrair_json_recursivo(obj, out):
+              if isinstance(obj, list):
+                  for it in obj:
+                      extrair_json_recursivo(it, out)
+              elif isinstance(obj, dict):
+                  low = {str(k).lower(): k for k in obj.keys()}
+                  ctx = " ".join(
+                      str(obj[low[k]])
+                      for k in ("title", "name", "description", "text", "discount", "label")
+                      if k in low and isinstance(obj[low[k]], (str, int, float))
+                  )
+                  for chave in chaves_alta:
+                      if chave in low and isinstance(obj[low[chave]], str):
+                          cod = validar_codigo(obj[low[chave]], exigir_digito=False)
+                          if cod:
+                              out.append((cod, ctx))
+                  if "code" in low and (set(low.keys()) & chaves_ctx) and isinstance(obj[low["code"]], str):
+                      cod = validar_codigo(obj[low["code"]], exigir_digito=True)
+                      if cod:
+                          out.append((cod, ctx))
+                  for v in obj.values():
+                      if isinstance(v, (dict, list)):
+                          extrair_json_recursivo(v, out)
+
+          padroes_html = [
+              (r'"(?:couponCode|voucherCode|promoCode|discountCode)"\s*:\s*"([A-Za-z0-9_-]{5,20})"', False),
+              (r'(?:cupom|c[oó]digo)\s*[:\-]?\s*<[^>]+>\s*([A-Z0-9]{5,15})\s*<', True),
+              (r'\b(?:usar?\s+o?\s*cupom|c[oó]digo\s+promocional)\s+([A-Z0-9]{5,15})\b', False),
+          ]
+
+          for nome_fonte, url_fonte in fontes_web.items():
+              try:
+                  status, bruto_html = baixar_texto(url_fonte, timeout=20)
+                  conteudo = html.unescape(bruto_html)
+                  sucessos += 1
+                  print(f"[{nome_fonte}] HTTP {status} | {len(conteudo)} chars.")
+
+                  candidatos = []
+                  for bloco_json in re.findall(
+                      r'<script[^>]*(?:id="__NEXT_DATA__"|type="application/ld\+json")[^>]*>(.*?)</script>',
+                      bruto_html,
+                      flags=re.IGNORECASE | re.DOTALL,
+                  ):
+                      try:
+                          extrair_json_recursivo(json.loads(bloco_json.strip()), candidatos)
+                      except json.JSONDecodeError:
+                          continue
+
+                  for padrao, exigir_dig in padroes_html:
+                      for m in re.finditer(padrao, conteudo, flags=re.IGNORECASE):
+                          cod = validar_codigo(m.group(1), exigir_digito=exigir_dig)
+                          if cod:
+                              trecho = conteudo[max(0, m.start() - 250):min(len(conteudo), m.end() + 250)]
+                              candidatos.append((cod, trecho))
+
+                  for cod, ctx in candidatos:
+                      registrar_cupom(cod, extrair_desconto_brl(ctx), nome_fonte, URL_SHOPEE_PADRAO)
+
+              except urllib.error.HTTPError as e:
+                  msg = f"{nome_fonte}: HTTP {e.code}"
+                  print(f"[erro] {msg}")
+                  falhas.append(msg)
+              except Exception as e:
+                  msg = f"{nome_fonte}: {type(e).__name__}"
+                  print(f"[erro] {msg}")
+                  falhas.append(msg)
+
+          # 4. Salvar memoria e notificar apenas novidades
+          agora_ts = int(time.time())
+          if encontrados:
+              for cod in encontrados:
+                  estado["seen_codes"][cod] = agora_ts
+
+              link_clique = next(
+                  (info["link"] for info in encontrados.values() if info["link"] != URL_SHOPEE_PADRAO),
+                  URL_SHOPEE_PADRAO,
+              )
+              linhas = []
+              for cod, info in list(encontrados.items())[:15]:
+                  val_txt = f" (ate R$ {info['valor']:g})" if info["valor"] > 0 else ""
+                  linhas.append(f"- {cod}{val_txt} [{info['fonte']}]")
+
+              if not estado.get("initialized"):
+                  estado["initialized"] = True
+                  salvar_estado(estado)
+                  enviar_ntfy(
+                      f"Monitor Shopee Ativo ({len(encontrados)} cupons)",
+                      "Base inicial registrada (sem cookies):\n"
+                      + "\n".join(linhas)
+                      + "\n\nA partir de agora, voce so recebe alerta quando surgir cupom novo.",
+                      click_url=link_clique,
+                      prioridade=3,
+                      tags=["white_check_mark", "shopping"],
+                  )
+              else:
+                  salvar_estado(estado)
+                  enviar_ntfy(
+                      f"NOVO Cupom Shopee ({len(encontrados)})!",
+                      "Detectado agora:\n"
+                      + "\n".join(linhas)
+                      + "\n\nToque para abrir os cupons na Shopee.",
+                      click_url=link_clique,
+                      prioridade=5,
+                      tags=["rotating_light", "fire", "shopping"],
+                  )
+          else:
+              salvar_estado(estado)
+              print(f"[ok] Nenhum cupom inedito. Fontes OK: {sucessos} | Historico: {len(ja_enviados)}")
+              if modo_teste == "sim":
+                  resumo_falhas = f"\nAvisos: {'; '.join(falhas)}" if falhas else ""
+                  enviar_ntfy(
+                      "Teste Monitor Shopee OK",
+                      f"Fluxo rapido (sem cookies) funcionando.\nFontes lidas: {sucessos}\n"
+                      f"Cupons ja na memoria: {len(ja_enviados)}{resumo_falhas}",
+                      click_url=URL_SHOPEE_PADRAO,
+                      prioridade=3,
+                      tags=["white_check_mark"],
+                  )
+
+          if sucessos == 0:
+              raise SystemExit(f"ERRO: Todas as fontes falharam ({'; '.join(falhas)}).")
           EOF
