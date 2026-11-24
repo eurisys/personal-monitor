@@ -1,100 +1,164 @@
-name: Alerta Cupons Shopee
+name: Alerta de Cupons Shopee
 
 on:
   workflow_dispatch:
     inputs:
       modo_teste:
-        description: 'Forcar notificacao de teste?'
+        description: 'Enviar notificacao de teste? (sim/nao)'
         required: false
         default: 'sim'
       desconto_minimo_reais:
-        description: 'Filtrar descontos a partir de R$ (0 = todos)'
+        description: 'Desconto minimo em Reais (0 = todos)'
         required: false
         default: '0'
 
 jobs:
-  radar:
+  verificar_cupons:
     runs-on: ubuntu-latest
-    timeout-minutes: 2
-    env:
-      TOPICO: ${{ secrets.NTFY_TOPIC }}
-      MODO_TESTE: ${{ inputs.modo_teste }}
-      MIN_REAIS: ${{ inputs.desconto_minimo_reais }}
+    timeout-minutes: 5
     steps:
-      - name: Checar cupons e alertar
+      - name: Buscar cupons novos e notificar via ntfy
+        env:
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+          MODO_TESTE: ${{ github.event.inputs.modo_teste }}
+          DESCONTO_MIN: ${{ github.event.inputs.desconto_minimo_reais }}
         run: |
           python3 - << 'EOF'
-          import os, re, json, html, urllib.request
+          import os
+          import re
+          import json
+          import html
+          import urllib.request
+          import urllib.parse
 
-          topico = os.environ.get("TOPICO", "").strip()
-          if not topico:
-              raise SystemExit("Erro: Secret NTFY_TOPIC nao configurado.")
+          topico = os.environ.get("NTFY_TOPIC", "").strip().strip("/")
+          modo_teste = (os.environ.get("MODO_TESTE") or "nao").strip().lower()
+          desconto_str = (os.environ.get("DESCONTO_MIN") or "0").strip()
 
-          forcar_teste = (os.environ.get("MODO_TESTE", "nao").lower() == "sim")
-          min_reais = int(os.environ.get("MIN_REAIS", "0") or "0")
-
-          # 1. Historico das ultimas 24h direto do ntfy (evita repeticao)
-          ja_enviados = ""
           try:
-              req_hist = urllib.request.Request(f"https://ntfy.sh{topico}/json?poll=1&since=24h")
-              with urllib.request.urlopen(req_hist, timeout=10) as r:
-                  for linha in r.read().decode("utf-8", "ignore").splitlines():
-                      if linha.strip():
-                          ja_enviados += json.loads(linha).get("message", "") + "\n"
-          except Exception:
-              pass
+              desconto_min = float(desconto_str.replace(",", "."))
+          except ValueError:
+              desconto_min = 0.0
 
-          # 2. Varre fontes agregadoras de cupons ativos da Shopee Brasil
-          fontes = [
-              "https://pelando.com.br",
-              "https://cuponomia.com.br",
-              "https://meliuz.com.br"
-          ]
-          headers = {
-              "User-Agent": "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 Chrome/126.0.0.0 Mobile Safari/537.36",
-              "Accept-Language": "pt-BR,pt;q=0.9"
+          if not topico:
+              raise SystemExit("ERRO: Secret NTFY_TOPIC vazio ou nao configurado.")
+
+          # Montagem segura de URLs sem risco de corte de barras
+          def criar_url(dominio, caminho, query=""):
+              caminho_limpo = "/" + caminho.lstrip("/")
+              return urllib.parse.urlunsplit(("https", dominio, caminho_limpo, query, ""))
+
+          url_ntfy_post = criar_url("ntfy.sh", topico)
+          url_ntfy_hist = criar_url("ntfy.sh", f"{topico}/json", "poll=1&since=24h")
+          url_shopee_click = criar_url("shopee.com.br", "m/cupons-diarios")
+
+          fontes = {
+              "Pelando": criar_url("://pelando.com.br", "cupons-de-descontos/shopee"),
+              "Cuponomia": criar_url("://cuponomia.com.br", "desconto/shopee"),
+              "Meliuz": criar_url("://meliuz.com.br", "desconto/cupom-shopee"),
           }
 
-          encontrados = []
-          padrao = re.compile(r">([^<]{12,95}(?:R\$\s?\d+|\d+%\s?OFF|FRETE\s?GR[ÁA]TIS)[^<]{0,45})<", re.I)
+          headers_nav = {
+              "User-Agent": "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Mobile Safari/537.36",
+              "Accept-Language": "pt-BR,pt;q=0.9",
+          }
 
-          for url in fontes:
+          # 1. Ler historico das ultimas 24h direto do ntfy para nao repetir cupom
+          ja_enviados = set()
+          try:
+              req_hist = urllib.request.Request(url_ntfy_hist, headers=headers_nav)
+              with urllib.request.urlopen(req_hist, timeout=15) as resp:
+                  for linha in resp.read().decode("utf-8", errors="ignore").splitlines():
+                      if not linha.strip():
+                          continue
+                      try:
+                          evento = json.loads(linha)
+                          msg = evento.get("message", "")
+                          for cod in re.findall(r"\b[A-Z0-9]{5,15}\b", msg.upper()):
+                              ja_enviados.add(cod)
+                      except Exception:
+                          pass
+          except Exception as e:
+              print(f"Aviso ao consultar historico ntfy: {e}")
+
+          # 2. Varrer as paginas de cupons da Shopee
+          ignorar = {
+              "SHOPEE", "CUPOM", "CUPONS", "DESCONTO", "DESCONTOS", "GRATIS",
+              "FRETE", "BRASIL", "OFERTA", "OFERTAS", "PROMOCAO", "MELIUZ",
+              "PELANDO", "CUPONOMIA", "HTML", "HTTPS", "SCRIPT", "STYLE",
+              "WINDOW", "DOCUMENT", "FUNCTION", "RETURN", "TRUE", "FALSE",
+              "NULL", "UNDEFINED", "CLASS", "BUTTON", "HEADER", "FOOTER",
+              "SHOPEEBR", "COMPRA", "COMPRAS", "LOJAS", "TODOS", "TODAS",
+              "ATIVO", "ATIVOS", "EXPIRADO", "VERIFICADO", "PEGAR", "COPIAR"
+          }
+
+          padroes_extracao = [
+              r'"(?:code|couponCode|voucherCode|promoCode|cupom)"\s*:\s*"([A-Za-z0-9]{5,15})"',
+              r'(?:cupom|c[oó]digo)\s*[:\-]?\s*<[^>]+>\s*([A-Z0-9]{5,15})\s*<',
+              r'\b(?:usar?\s+o?\s*cupom|c[oó]digo\s+promocional)\s+([A-Z0-9]{5,15})\b',
+          ]
+
+          encontrados = {}
+
+          for nome_fonte, url_fonte in fontes.items():
               try:
-                  req = urllib.request.Request(url, headers=headers)
-                  with urllib.request.urlopen(req, timeout=15) as r:
-                      conteudo = html.unescape(r.read().decode("utf-8", "ignore"))
-                      for texto in padrao.findall(conteudo):
-                          limpo = re.sub(r"\s+", " ", texto).strip()
-                          if len(limpo) < 12 or limpo in ja_enviados or limpo in encontrados:
+                  req = urllib.request.Request(url_fonte, headers=headers_nav)
+                  with urllib.request.urlopen(req, timeout=20) as resp:
+                      conteudo = html.unescape(resp.read().decode("utf-8", errors="ignore"))
+
+                  for padrao in padroes_extracao:
+                      for match in re.finditer(padrao, conteudo, flags=re.IGNORECASE):
+                          codigo = match.group(1).upper().strip()
+                          # Exige pelo menos 1 letra e 1 numero ou tamanho tipico de cupom valido sem ser palavra comum
+                          if codigo in ignorar or codigo.isdigit() or len(codigo) < 5:
                               continue
-                          # Aplica filtro opcional de valor minimo em R$
-                          if min_reais > 0:
-                              m_val = re.search(r"R\$\s?(\d+)", limpo, re.I)
-                              if m_val and int(m_val.group(1)) < min_reais:
-                                  continue
-                          encontrados.append(limpo)
-              except Exception:
-                  pass
+                          if not any(c.isalpha() for c in codigo):
+                              continue
 
-          novos = encontrados[:6]
+                          trecho = conteudo[max(0, match.start() - 250):min(len(conteudo), match.end() + 250)]
+                          valores_reais = [
+                              float(v.replace(",", "."))
+                              for v in re.findall(r"R\$\s*(\d+(?:[.,]\d{1,2})?)", trecho)
+                          ]
+                          maior_valor = max(valores_reais) if valores_reais else 0.0
 
-          # 3. Envia push pro Android apenas se houver novidade (ou teste manual)
-          if novos or forcar_teste:
-              corpo = "• " + "\n• ".join(novos) if novos else "• Teste manual OK! Pontualidade externa pronta."
-              titulo = f"{len(novos)} Novo(s) Cupom(ns) Shopee!" if novos else "Radar Shopee Pronto!"
+                          if desconto_min > 0 and maior_valor < desconto_min:
+                              continue
 
-              disparo = urllib.request.Request(
-                  f"https://ntfy.sh{topico}",
-                  data=corpo.encode("utf-8"),
-                  headers={
-                      "Title": titulo,
-                      "Click": "https://shopee.com.br",
-                      "Tags": "ticket,zap"
-                  },
-                  method="POST"
+                          if codigo not in ja_enviados and codigo not in encontrados:
+                              info_valor = f" (ate R$ {maior_valor:g})" if maior_valor > 0 else ""
+                              encontrados[codigo] = f"{codigo}{info_valor} [{nome_fonte}]"
+              except Exception as e:
+                  print(f"Erro ao ler {nome_fonte} ({url_fonte}): {e}")
+
+          # 3. Disparar notificacao no ntfy (se houver cupom novo ou se for teste manual)
+          def enviar_ntfy(titulo, texto, prioridade="default", tags="shopping,tag"):
+              headers_post = {
+                  "Title": titulo,
+                  "Priority": prioridade,
+                  "Tags": tags,
+                  "Click": url_shopee_click,
+              }
+              req_post = urllib.request.Request(
+                  url_ntfy_post,
+                  data=texto.encode("utf-8"),
+                  headers=headers_post,
+                  method="POST",
               )
-              urllib.request.urlopen(disparo, timeout=10)
-              print(f"Notificacao enviada ({len(novos)} novos).")
+              with urllib.request.urlopen(req_post, timeout=15) as r:
+                  print(f"Notificacao enviada! Status HTTP ntfy: {r.status}")
+
+          if encontrados:
+              lista_linhas = "\n".join(f"- {detalhe}" for detalhe in list(encontrados.values())[:15])
+              corpo = f"Novos cupons Shopee detectados:\n{lista_linhas}\n\nToque para abrir os cupons diarios."
+              enviar_ntfy("Cupons Novos Shopee!", corpo, prioridade="high", tags="fire,shopping")
+          elif modo_teste == "sim":
+              corpo = (
+                  "Teste concluido com sucesso! Conexao GitHub -> ntfy funcionando.\n"
+                  f"Nenhum cupom inedito nas ultimas 24h (historico atual: {len(ja_enviados)} codigos).\n"
+                  "Toque na notificacao para testar o atalho da Shopee."
+              )
+              enviar_ntfy("Teste Alerta Shopee OK", corpo, prioridade="default", tags="white_check_mark")
           else:
-              print("Sem cupons ineditos nesta virada de hora.")
+              print("Nenhum cupom novo encontrado e modo_teste='nao'. Silencio mantido.")
           EOF
