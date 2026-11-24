@@ -16,11 +16,6 @@ on:
         required: false
         default: '0'
         type: string
-      canais_telegram:
-        description: 'Canais publicos Telegram separados por virgula (opcional)'
-        required: false
-        default: ''
-        type: string
 
 permissions: {}
 
@@ -32,8 +27,9 @@ jobs:
   verificar_cupons:
     runs-on: ubuntu-latest
     timeout-minutes: 3
+
     steps:
-      - name: Restaurar memoria de cupons ja enviados
+      - name: Restaurar memoria de cupons e URL ativa
         uses: actions/cache@v4
         with:
           path: ~/.cache/shopee-monitor
@@ -41,16 +37,18 @@ jobs:
           restore-keys: |
             shopee-state-
 
-      - name: Buscar cupons novos sem cookies e notificar via ntfy
+      - name: Monitorar cupons Shopee (API Oficial + Feeds Publicos) e notificar via ntfy
         env:
           NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
-          TELEGRAM_CHANNELS_VAR: ${{ vars.TELEGRAM_CHANNELS }}
-          TELEGRAM_CHANNELS_INPUT: ${{ inputs.canais_telegram }}
+          SHOPEE_APP_ID: ${{ secrets.SHOPEE_APP_ID }}
+          SHOPEE_APP_SECRET: ${{ secrets.SHOPEE_APP_SECRET }}
+          SHOPEE_TG_CHANNELS: ${{ vars.SHOPEE_TG_CHANNELS }}
           MODO_TESTE: ${{ inputs.modo_teste }}
           DESCONTO_MIN: ${{ inputs.desconto_minimo_reais }}
         run: |
           python3 - << 'EOF'
-          import gzip
+          import datetime
+          import hashlib
           import html
           import json
           import os
@@ -61,103 +59,480 @@ jobs:
           import urllib.request
           from pathlib import Path
 
-          topico_bruto = os.environ.get("NTFY_TOPIC", "").strip()
-          topico = re.sub(r"^https?://ntfy\.sh/", "", topico_bruto, flags=re.IGNORECASE).strip("/")
-          modo_teste = (os.environ.get("MODO_TESTE") or "nao").strip().lower()
-          desconto_str = (os.environ.get("DESCONTO_MIN") or "0").strip()
+          SEED_SHORT_URL = "https://br.shp.ee/SLB8wX71"
+          DEFAULT_ACTIVE_URL = "https://shopee.com.br/m/cupom-de-desconto"
+          SHOPEE_GRAPHQL_URL = "https://open-api.affiliate.shopee.com.br/graphql"
+          DEFAULT_TG_CHANNELS = ["promotop", "pechinchou", "xetdaspromocoes", "ofertas"]
 
-          try:
-              desconto_min = max(0.0, float(desconto_str.replace(",", ".")))
-          except ValueError:
-              desconto_min = 0.0
-
-          if not topico or "/" in topico or " " in topico:
-              raise SystemExit("ERRO: Secret NTFY_TOPIC vazio ou invalido.")
-
-          URL_SHOPEE_PADRAO = "https://shopee.com.br/m/cupom-de-desconto"
-
-          cache_dir = Path.home() / ".cache" / "shopee-monitor"
-          cache_dir.mkdir(parents=True, exist_ok=True)
-          state_file = cache_dir / "state.json"
-
-          def carregar_estado():
-              if state_file.exists():
-                  try:
-                      return json.loads(state_file.read_text(encoding="utf-8"))
-                  except json.JSONDecodeError:
-                      pass
-              return {"seen_codes": {}, "initialized": False}
-
-          def salvar_estado(estado):
-              vistos = estado.get("seen_codes", {})
-              if len(vistos) > 2500:
-                  ordenados = sorted(vistos.items(), key=lambda kv: kv[1], reverse=True)[:2500]
-                  estado["seen_codes"] = dict(ordenados)
-              state_file.write_text(json.dumps(estado, ensure_ascii=False, indent=2), encoding="utf-8")
-
-          headers_nav = {
-              "User-Agent": (
-                  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                  "AppleWebKit/537.36 (KHTML, like Gecko) "
-                  "Chrome/131.0.0.0 Safari/537.36"
-              ),
-              "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-              "Accept-Language": "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7",
-              "Accept-Encoding": "gzip, identity",
-              "Cache-Control": "no-cache",
+          CODIGOS_PLACEHOLDER = {
+              "CUPOMNOLINK",
+              "DESCONTONOLINK",
+              "RESGATECUPONS",
+              "GARANTADESCONTO",
+              "PEGUECUPOM",
+              "GANHEDESCONTO",
+              "DESCONTOAQUI",
+              "CUPOMAQUI",
+              "VERCUPOM",
+              "VEROFERTA",
+              "ATIVARCUPOM",
+              "FRETEGRATIS",
+              "CUPOMNOAPP",
+              "EUQUERO",
+              "CUPOM",
+              "SHOPEE",
+              "DESCONTO",
+              "CARRINHO",
+              "APLICATIVO",
+              "OFERTAS",
+              "PROMOCAO",
           }
 
-          def baixar_texto(url, headers=None, timeout=20):
-              req = urllib.request.Request(url, headers=headers or headers_nav)
-              with urllib.request.urlopen(req, timeout=timeout) as resp:
-                  bruto = resp.read()
-                  if resp.headers.get("Content-Encoding", "").lower() == "gzip":
-                      bruto = gzip.decompress(bruto)
-                  return resp.status, bruto.decode("utf-8", errors="ignore")
+          CTA_PREFIXOS = (
+              "PEGUE",
+              "GANHE",
+              "RESGATE",
+              "GARANTA",
+              "CONFIRA",
+              "ACESSE",
+              "CLIQUE",
+              "APROVEITE",
+          )
 
-          def parse_valor_brl(texto_num):
-              s = texto_num.strip()
-              if "," in s and "." in s:
-                  s = s.replace(".", "").replace(",", ".")
-              elif "," in s:
-                  s = s.replace(",", ".")
-              elif re.fullmatch(r"\d{1,3}(?:\.\d{3})+", s):
-                  s = s.replace(".", "")
+          MIN_SPEND_RE = re.compile(
+              r"(?:acima\s+de|a\s+partir\s+de|m[ií]nim[oa]\s+de|"
+              r"pedidos?\s+superiores?\s+a|compras?\s+(?:acima|a\s+partir)\s+de|"
+              r"compre(?:\s+a\s+partir\s+de)?)"
+              r"\s+(?:R\$\s*)?(\d+(?:[.,]\d{1,2})?)(?:\s*reais)?",
+              re.I,
+          )
+          CASHBACK_RE = re.compile(
+              r"(?:at[eé]\s*)?(?:R\$\s*\d+(?:[.,]\d{1,2})?|\d+(?:[.,]\d{1,2})?\s*%)"
+              r"\s*(?:de\s+)?cashback",
+              re.I,
+          )
+
+
+          class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+              def redirect_request(self, req, fp, code, msg, headers, newurl):
+                  return None
+
+
+          def limpar_texto(texto_html):
+              if not texto_html:
+                  return ""
+              txt = html.unescape(str(texto_html))
+              txt = re.sub(r"<[^>]+>", " ", txt)
+              return re.sub(r"\s+", " ", txt).strip()
+
+
+          def _to_float(num_str):
               try:
-                  return float(s)
-              except ValueError:
+                  return round(float(num_str.replace(",", ".")), 2)
+              except Exception:
                   return 0.0
 
-          def extrair_desconto_brl(trecho):
-              if not trecho:
-                  return 0.0
-              padroes_diretos = [
-                  r"R\$\s*(\d+(?:[.,]\d{1,3})*)\s*(?:off|de\s+desconto|em\s+desconto|desconto)\b",
-                  r"(?:desconto\s+de|ganhe|economize|at[eé]|cupom\s+de)\s+R\$\s*(\d+(?:[.,]\d{1,3})*)",
-              ]
-              diretos = []
-              for pad in padroes_diretos:
-                  for m in re.finditer(pad, trecho, flags=re.IGNORECASE):
-                      v = parse_valor_brl(m.group(1))
-                      if v > 0:
-                          diretos.append(v)
-              if diretos:
-                  return max(diretos)
 
-              trecho_limpo = re.sub(
-                  r"(?:acima\s+de|a\s+partir\s+de|m[ií]nim[oa]\s*(?:de)?|compras?\s+de)\s*R\$\s*\d+(?:[.,]\d{1,3})*",
-                  " ",
-                  trecho,
-                  flags=re.IGNORECASE,
+          def extrair_valores_brl_pct(texto_desconto, texto_regras=""):
+              partes = [p for p in (limpar_texto(texto_desconto), limpar_texto(texto_regras)) if p]
+              combinado = " | ".join(partes)
+              if not combinado:
+                  return 0.0, 0, 0.0
+
+              combinado_sem_cb = CASHBACK_RE.sub(" ", combinado)
+
+              min_spend = 0.0
+              m_min = MIN_SPEND_RE.search(combinado_sem_cb)
+              if m_min:
+                  min_spend = _to_float(m_min.group(1))
+
+              sem_min = MIN_SPEND_RE.sub(" ", combinado_sem_cb)
+
+              desconto_reais = 0.0
+              m_brl = re.search(r"R\$\s*(\d+(?:[.,]\d{1,2})?)", sem_min, re.I)
+              if not m_brl:
+                  m_brl = re.search(
+                      r"(?:voucher|cupom|desconto)\s+de\s+(\d+(?:[.,]\d{1,2})?)\s*reais\b",
+                      sem_min,
+                      re.I,
+                  )
+              if not m_brl:
+                  m_brl = re.search(
+                      r"(\d+(?:[.,]\d{1,2})?)\s*reais\s*(?:de\s+desconto|off)\b",
+                      sem_min,
+                      re.I,
+                  )
+              if m_brl:
+                  desconto_reais = _to_float(m_brl.group(1))
+
+              desconto_pct = 0
+              m_pct = re.search(r"(\d{1,2})\s*%\s*(?:OFF|de\s+desconto)", sem_min, re.I)
+              if m_pct:
+                  desconto_pct = int(m_pct.group(1))
+
+              return desconto_reais, desconto_pct, min_spend
+
+
+          def eh_codigo_cupom_real(codigo):
+              cod = (codigo or "").strip().upper()
+              if not re.fullmatch(r"[A-Z0-9_-]{4,25}", cod):
+                  return False
+              if cod in CODIGOS_PLACEHOLDER:
+                  return False
+              if not any(ch.isdigit() for ch in cod):
+                  if len(cod) > 12 or cod.startswith(CTA_PREFIXOS):
+                      return False
+              return True
+
+
+          def resolver_url_oficial(url_atual):
+              opener = urllib.request.build_opener(_NoRedirectHandler())
+              req = urllib.request.Request(
+                  SEED_SHORT_URL,
+                  headers={
+                      "User-Agent": "Mozilla/5.0 (compatible; personal-monitor/2.0)",
+                      "Accept-Language": "pt-BR,pt;q=0.9",
+                  },
               )
-              restantes = [
-                  parse_valor_brl(v)
-                  for v in re.findall(r"R\$\s*(\d+(?:[.,]\d{1,3})*)", trecho_limpo)
-              ]
-              restantes = [v for v in restantes if v > 0]
-              return min(restantes) if restantes else 0.0
+              destino = ""
+              try:
+                  with opener.open(req, timeout=10) as resp:
+                      destino = resp.geturl() or ""
+              except urllib.error.HTTPError as exc:
+                  if exc.code in (301, 302, 303, 307, 308):
+                      destino = exc.headers.get("Location", "")
+              except Exception as exc:
+                  print(f"[url] Aviso ao checar {SEED_SHORT_URL}: {exc}")
+                  return url_atual
 
-          def enviar_ntfy(titulo, mensagem, click_url=URL_SHOPEE_PADRAO, prioridade=4, tags=None):
+              if not destino:
+                  return url_atual
+
+              parts = urllib.parse.urlsplit(destino.strip())
+              host = parts.netloc.lower().split(":")[0]
+              path = parts.path or "/"
+              if (
+                  host.endswith("shopee.com.br")
+                  and "/buyer/login" not in path.lower()
+                  and "/verify/" not in path.lower()
+              ):
+                  limpa = f"{parts.scheme}://{parts.netloc}{path}"
+                  if limpa != url_atual:
+                      print(f"[url] Destino oficial atualizado: {limpa}")
+                  else:
+                      print(f"[url] Destino oficial confirmado: {limpa}")
+                  return limpa
+              return url_atual
+
+
+          def assinar_shopee_graphql(app_id, app_secret, payload_str, timestamp):
+              factor = f"{app_id}{timestamp}{payload_str}{app_secret}"
+              signature = hashlib.sha256(factor.encode("utf-8")).hexdigest()
+              return f"SHA256 Credential={app_id},Timestamp={timestamp},Signature={signature}"
+
+
+          def coletar_shopee_oficial_graphql(app_id, app_secret, agora_ts):
+              if not app_id or not app_secret:
+                  print(
+                      "[shopee-api] SHOPEE_APP_ID / SHOPEE_APP_SECRET ainda nao "
+                      "configurados. Pulando camada GraphQL oficial."
+                  )
+                  return {}
+
+              query = (
+                  "query{shopeeOfferV2(sortType:1,page:1,limit:30)"
+                  "{nodes{collectionId offerName offerType originalLink "
+                  "offerLink periodStartTime periodEndTime}}}"
+              )
+              payload_str = json.dumps({"query": query}, separators=(",", ":"))
+              timestamp = int(agora_ts)
+              auth_header = assinar_shopee_graphql(app_id, app_secret, payload_str, timestamp)
+
+              req = urllib.request.Request(
+                  SHOPEE_GRAPHQL_URL,
+                  data=payload_str.encode("utf-8"),
+                  headers={
+                      "Content-Type": "application/json",
+                      "Authorization": auth_header,
+                      "User-Agent": "personal-monitor/2.0",
+                  },
+                  method="POST",
+              )
+              try:
+                  with urllib.request.urlopen(req, timeout=15) as resp:
+                      body = resp.read().decode("utf-8", errors="ignore")
+                  dados = json.loads(body)
+              except urllib.error.HTTPError as exc:
+                  print(f"[shopee-api] Erro HTTP {exc.code} ao consultar API Oficial.")
+                  return {}
+              except Exception as exc:
+                  print(f"[shopee-api] Falha de comunicacao com API Oficial: {exc}")
+                  return {}
+
+              if isinstance(dados, dict) and dados.get("errors"):
+                  msgs = [
+                      str(e.get("message", ""))[:80]
+                      for e in dados.get("errors", [])
+                      if isinstance(e, dict)
+                  ]
+                  print(f"[shopee-api] API retornou erros: {'; '.join(msgs)}")
+                  return {}
+
+              nodes = (
+                  dados.get("data", {})
+                  .get("shopeeOfferV2", {})
+                  .get("nodes", [])
+                  if isinstance(dados, dict)
+                  else []
+              )
+              coletados = {}
+              palavras_chave = ("cupom", "cupons", "voucher", "desconto", "frete", "off", "/m/")
+              for node in nodes or []:
+                  if not isinstance(node, dict):
+                      continue
+                  period_end = node.get("periodEndTime") or 0
+                  if isinstance(period_end, (int, float)) and period_end > 0 and period_end < agora_ts:
+                      continue
+
+                  nome = limpar_texto(node.get("offerName") or "")
+                  orig = str(node.get("originalLink") or "").strip()
+                  link = str(node.get("offerLink") or orig).strip()
+                  offer_type = node.get("offerType")
+                  texto_cmp = f"{nome} {orig}".lower()
+                  if offer_type != 2 and not any(k in texto_cmp for k in palavras_chave):
+                      continue
+
+                  coll_id = str(node.get("collectionId") or orig or nome).strip()
+                  if not coll_id:
+                      continue
+                  desc_r, desc_p, min_s = extrair_valores_brl_pct(nome)
+                  chave = f"SHOPEE_API:{coll_id}"
+                  coletados[chave] = {
+                      "codigo": "",
+                      "titulo": nome[:95],
+                      "desconto_reais": desc_r,
+                      "desconto_pct": desc_p,
+                      "min_spend": min_s,
+                      "link": link,
+                      "fontes": ["Shopee Oficial API"],
+                  }
+              print(f"[shopee-api] Campanhas oficiais filtradas: {len(coletados)}")
+              return coletados
+
+
+          def fetch_public_html(url):
+              req = urllib.request.Request(
+                  url,
+                  headers={
+                      "User-Agent": "Mozilla/5.0 (compatible; personal-monitor/2.0)",
+                      "Accept-Language": "pt-BR,pt;q=0.9",
+                  },
+              )
+              try:
+                  with urllib.request.urlopen(req, timeout=15) as resp:
+                      if resp.status >= 400:
+                          print(f"[feed] HTTP {resp.status} em {url}; ignorando fonte.")
+                          return ""
+                      body = resp.read().decode("utf-8", errors="ignore")
+              except Exception as exc:
+                  print(f"[feed] Falha ao ler {url}: {exc}")
+                  return ""
+
+              low = body[:60000].lower()
+              if any(sig in low for sig in ("cf-chl", "turnstile", "verify you are human", "just a moment")):
+                  print(f"[feed] Challenge detectado em {url}; ignorando fonte sem contorno.")
+                  return ""
+              return body
+
+
+          def _registrar_codigo(dest, codigo, titulo, desc_r, desc_p, min_s, fonte, link=""):
+              cod = codigo.strip().upper()
+              if not eh_codigo_cupom_real(cod):
+                  return
+              chave = f"CODE:{cod}"
+              atual = dest.get(chave)
+              if not atual:
+                  dest[chave] = {
+                      "codigo": cod,
+                      "titulo": titulo[:95],
+                      "desconto_reais": desc_r,
+                      "desconto_pct": desc_p,
+                      "min_spend": min_s,
+                      "link": link,
+                      "fontes": [fonte],
+                  }
+                  return
+              if fonte not in atual["fontes"]:
+                  atual["fontes"].append(fonte)
+              if desc_r > atual["desconto_reais"]:
+                  atual["desconto_reais"] = desc_r
+              if desc_p > atual["desconto_pct"]:
+                  atual["desconto_pct"] = desc_p
+              if min_s > 0 and atual["min_spend"] == 0:
+                  atual["min_spend"] = min_s
+              if len(titulo) > len(atual["titulo"]):
+                  atual["titulo"] = titulo[:95]
+
+
+          def coletar_cuponomia(dest):
+              url = "https://www.cuponomia.com.br/desconto/shopee"
+              body = fetch_public_html(url)
+              if not body:
+                  return 0
+              qtd = 0
+              for card in re.findall(r'<li[^>]*class="[^"]*item-code[^"]*"[^>]*>(.*?)</li>', body, re.S):
+                  m_cod = re.search(r'js-itemCode[^>]*>(.*?)</span>', card, re.S)
+                  if not m_cod:
+                      continue
+                  cod = limpar_texto(m_cod.group(1)).upper()
+                  if not eh_codigo_cupom_real(cod):
+                      continue
+                  m_badge = re.search(r'js-couponSmallText[^>]*>(.*?)</span>', card, re.S)
+                  m_tit = re.search(r'js-itemTitle[^>]*>(.*?)</h3>', card, re.S)
+                  m_desc = re.search(r'class="item-desc"[^>]*>(.*?)</div>', card, re.S)
+                  badge = limpar_texto(m_badge.group(1)) if m_badge else ""
+                  titulo = limpar_texto(m_tit.group(1)) if m_tit else badge
+                  regras = limpar_texto(m_desc.group(1)) if m_desc else ""
+                  desc_r, desc_p, min_s = extrair_valores_brl_pct(f"{badge} {titulo}", regras)
+                  _registrar_codigo(dest, cod, titulo, desc_r, desc_p, min_s, "Cuponomia", url)
+                  qtd += 1
+              print(f"[feed] Cuponomia: {qtd} codigos validos")
+              return qtd
+
+
+          def coletar_thiagorodrigo(dest):
+              url = "https://thiagorodrigo.com.br/cupom-desconto-shopee/"
+              body = fetch_public_html(url)
+              if not body:
+                  return 0
+              qtd = 0
+              for card in re.findall(r'<li[^>]*data-filter-code="true"[^>]*>(.*?)</li>', body, re.S):
+                  m_cod = re.search(r'data-full-code="([^"]+)"', card)
+                  if not m_cod:
+                      continue
+                  cod = limpar_texto(m_cod.group(1)).upper()
+                  if not eh_codigo_cupom_real(cod):
+                      continue
+                  m_tit = re.search(r'class="coupon-title[^"]*"[^>]*>(.*?)</h\d>', card, re.S)
+                  m_desc = re.search(r'class="coupon-description"[^>]*>(.*?)</p>', card, re.S)
+                  titulo = limpar_texto(m_tit.group(1)) if m_tit else f"Cupom {cod}"
+                  regras = limpar_texto(m_desc.group(1)) if m_desc else ""
+                  desc_r, desc_p, min_s = extrair_valores_brl_pct(titulo, regras)
+                  _registrar_codigo(dest, cod, titulo, desc_r, desc_p, min_s, "ThiagoRodrigo", url)
+                  qtd += 1
+              print(f"[feed] ThiagoRodrigo: {qtd} codigos validos")
+              return qtd
+
+
+          def coletar_meliuz(dest):
+              url = "https://www.meliuz.com.br/desconto/cupom-shopee"
+              body = fetch_public_html(url)
+              if not body:
+                  return 0
+              qtd = 0
+              for m in re.finditer(r'<div([^>]*data-offer-code="([^"]+)"[^>]*)>(.*?)</div>', body, re.S):
+                  attrs, raw_cod, inner = m.group(1), m.group(2), m.group(3)
+                  cod = limpar_texto(raw_cod).upper()
+                  if not eh_codigo_cupom_real(cod):
+                      continue
+                  m_tit = re.search(r'data-offer-title="([^"]+)"', attrs)
+                  m_strong = re.search(r'<strong>(.*?)</strong>', inner, re.S)
+                  titulo = limpar_texto(m_tit.group(1)) if m_tit else f"Cupom {cod}"
+                  badge = limpar_texto(m_strong.group(1)) if m_strong else ""
+                  desc_r, desc_p, min_s = extrair_valores_brl_pct(f"{badge} {titulo}")
+                  _registrar_codigo(dest, cod, titulo, desc_r, desc_p, min_s, "Meliuz", url)
+                  qtd += 1
+              print(f"[feed] Meliuz: {qtd} codigos validos")
+              return qtd
+
+
+          def coletar_telegram_publico(dest, canais, agora_ts):
+              total = 0
+              for canal in canais:
+                  canal_limpo = re.sub(r"[^a-zA-Z0-9_]", "", canal.strip().lstrip("@"))
+                  if not canal_limpo:
+                      continue
+                  url = f"https://t.me/s/{canal_limpo}"
+                  body = fetch_public_html(url)
+                  if not body:
+                      continue
+                  qtd_canal = 0
+                  blocos = body.split('<div class="tgme_widget_message_wrap')
+                  for bloco in blocos[1:]:
+                      m_dt = re.search(r'<time[^>]*datetime="([^"]+)"', bloco)
+                      if not m_dt:
+                          continue
+                      try:
+                          dt = datetime.datetime.fromisoformat(m_dt.group(1).replace("Z", "+00:00"))
+                      except ValueError:
+                          continue
+                      if (agora_ts - dt.timestamp()) > 86400:
+                          continue
+
+                      m_txt = re.search(
+                          r'<div class="tgme_widget_message_text[^"]*"[^>]*>(.*?)</div>',
+                          bloco,
+                          re.S,
+                      )
+                      if not m_txt:
+                          continue
+                      raw_msg = m_txt.group(1)
+                      txt_msg = limpar_texto(raw_msg)
+                      low_msg = txt_msg.lower()
+                      if not any(k in low_msg for k in ("shopee", "shope.ee", "shp.ee")):
+                          continue
+
+                      codigos_msg = []
+                      for c in re.findall(r"<code>([A-Z0-9_-]{4,22})</code>", raw_msg, re.I):
+                          codigos_msg.append((c.upper(), True))
+                      for c in re.findall(
+                          r"(?:cupom|c[oó]digo|voucher|🎟️)\s*:?\s*([A-Z0-9_-]{5,22})",
+                          txt_msg,
+                          re.I,
+                      ):
+                          codigos_msg.append((c.upper(), False))
+
+                      for cod, veio_de_code in codigos_msg:
+                          if not veio_de_code and not any(ch.isdigit() for ch in cod):
+                              continue
+                          if not eh_codigo_cupom_real(cod):
+                              continue
+                          desc_r, desc_p, min_s = extrair_valores_brl_pct(txt_msg)
+                          _registrar_codigo(
+                              dest,
+                              cod,
+                              txt_msg[:95],
+                              desc_r,
+                              desc_p,
+                              min_s,
+                              f"TG:@{canal_limpo}",
+                              url,
+                          )
+                          qtd_canal += 1
+                  print(f"[feed] Telegram @{canal_limpo}: {qtd_canal} codigos (24h)")
+                  total += qtd_canal
+              return total
+
+
+          def formatar_item(item):
+              cod = item.get("codigo")
+              fontes = ", ".join(item.get("fontes", []))
+              detalhes = []
+              if item["desconto_reais"] > 0:
+                  detalhes.append(f"R$ {item['desconto_reais']:g} OFF")
+              if item["desconto_pct"] > 0:
+                  detalhes.append(f"{item['desconto_pct']}% OFF")
+              if item["min_spend"] > 0:
+                  detalhes.append(f"min. R$ {item['min_spend']:g}")
+              info = f" ({', '.join(detalhes)})" if detalhes else ""
+              titulo = item.get("titulo", "")
+              if cod:
+                  sufixo_tit = f" — {titulo}" if titulo and titulo.upper() != cod else ""
+                  return f"- {cod}{info} [{fontes}]{sufixo_tit}"
+              return f"- {titulo}{info} [{fontes}]"
+
+
+          def enviar_ntfy(topico, titulo, mensagem, click_url, prioridade=4, tags=None):
               payload = {
                   "topic": topico,
                   "title": titulo,
@@ -166,267 +541,167 @@ jobs:
                   "tags": tags or ["fire", "shopping"],
                   "click": click_url,
               }
+              if os.environ.get("DRY_RUN") == "1":
+                  print("[DRY_RUN ntfy]", json.dumps(payload, ensure_ascii=False))
+                  return
               req = urllib.request.Request(
                   "https://ntfy.sh/",
                   data=json.dumps(payload).encode("utf-8"),
                   headers={
                       "Content-Type": "application/json; charset=utf-8",
-                      "User-Agent": "github-actions-shopee-fast/4.0",
+                      "User-Agent": "github-actions-shopee-hybrid/4.0",
                   },
                   method="POST",
               )
-              with urllib.request.urlopen(req, timeout=15) as r:
-                  print(f"[ntfy] Enviado (HTTP {r.status}): {titulo}")
+              with urllib.request.urlopen(req, timeout=15) as resp:
+                  print(f"[ntfy] Notificacao enviada (HTTP {resp.status}): {titulo}")
 
-          ignorar = {
-              "SHOPEE", "SHOPEEBR", "CUPOM", "CUPONS", "COUPON", "COUPONS", "VOUCHER",
-              "DESCONTO", "DESCONTOS", "DISCOUNT", "GRATIS", "FRETE", "BRASIL", "BRAZIL",
-              "OFERTA", "OFERTAS", "OFFER", "OFFERS", "PROMO", "PROMOCAO", "CASHBACK",
-              "MELIUZ", "PELANDO", "CUPONOMIA", "HTML", "HTTPS", "SCRIPT", "STYLE",
-              "WINDOW", "DOCUMENT", "FUNCTION", "RETURN", "TRUE", "FALSE", "NULL",
-              "UNDEFINED", "CLASS", "BUTTON", "HEADER", "FOOTER", "COMPRA", "COMPRAS",
-              "LOJAS", "TODOS", "TODAS", "ATIVO", "ATIVOS", "ACTIVE", "EXPIRADO",
-              "EXPIRED", "VERIFICADO", "VERIFIED", "PEGAR", "COPIAR", "SUCCESS",
-              "ERROR", "DEFAULT", "PRIMARY", "SECONDARY", "ENABLED", "DISABLED",
-              "POPULAR", "FEATURED", "PERCENT", "PUBLIC", "PRIVATE", "ONLINE",
-              "MOBILE", "DESKTOP", "TELEGRAM", "RESGATE", "CORRE", "APROVEITE",
-          }
 
-          def validar_codigo(codigo_bruto, exigir_digito=False):
-              codigo = codigo_bruto.upper().strip()
-              if not re.fullmatch(r"[A-Z0-9][A-Z0-9_-]{3,18}[A-Z0-9]", codigo):
-                  return None
-              if codigo in ignorar or codigo.isdigit():
-                  return None
-              if not any(c.isalpha() for c in codigo):
-                  return None
-              if exigir_digito and not any(c.isdigit() for c in codigo):
-                  return None
-              return codigo
-
-          # 1. Carregar memoria (cache GitHub + backup das ultimas 24h do ntfy)
-          estado = carregar_estado()
-          ja_enviados = set(estado.get("seen_codes", {}).keys())
-
-          try:
-              _, corpo_hist = baixar_texto(
-                  f"https://ntfy.sh/{urllib.parse.quote(topico)}/json?poll=1&since=24h",
-                  headers={"User-Agent": "github-actions-shopee-fast/4.0"},
-                  timeout=15,
-              )
-              for linha in corpo_hist.splitlines():
-                  if not linha.strip():
-                      continue
+          def carregar_estado(state_file):
+              if state_file.exists():
                   try:
-                      ev = json.loads(linha)
-                      if ev.get("event") != "message":
-                          continue
-                      for cod in re.findall(r"(?m)^-\s+([A-Z0-9][A-Z0-9_-]{3,19})\b", ev.get("message", "").upper()):
-                          ja_enviados.add(cod)
+                      dados = json.loads(state_file.read_text(encoding="utf-8"))
+                      if isinstance(dados, dict):
+                          return dados
                   except json.JSONDecodeError:
-                      continue
-          except Exception as e:
-              print(f"[aviso] Historico ntfy indisponivel: {e}")
+                      pass
+              return {
+                  "active_url": DEFAULT_ACTIVE_URL,
+                  "seen_vouchers": {},
+                  "initialized": False,
+              }
 
-          encontrados = {}
-          sucessos = 0
-          falhas = []
 
-          def registrar_cupom(codigo, valor, fonte, link_direto=URL_SHOPEE_PADRAO):
-              if desconto_min > 0 and valor < desconto_min:
-                  return
-              if codigo in ja_enviados:
-                  return
-              if codigo not in encontrados or valor > encontrados[codigo]["valor"]:
-                  encontrados[codigo] = {
-                      "valor": valor,
-                      "fonte": fonte,
-                      "link": link_direto or URL_SHOPEE_PADRAO,
-                  }
-
-          # 2. Fonte A: Canais publicos do Telegram (tempo real, sem bloqueio)
-          canais_brutos = os.environ.get("TELEGRAM_CHANNELS_INPUT") or os.environ.get("TELEGRAM_CHANNELS_VAR") or ""
-          canais_tg = []
-          for item in re.split(r"[,;\s]+", canais_brutos.strip()):
-              limpo = re.sub(r"^https?://t\.me/(?:s/)?", "", item, flags=re.IGNORECASE).lstrip("@").strip("/")
-              if re.fullmatch(r"[A-Za-z0-9_]{4,40}", limpo):
-                  canais_tg.append(limpo)
-
-          for canal in canais_tg:
-              url_tg = f"https://t.me/s/{canal}"
-              try:
-                  status, bruto = baixar_texto(url_tg, timeout=20)
-                  sucessos += 1
-                  blocos = re.findall(
-                      r'<div class="tgme_widget_message_text[^"]*"[^>]*>(.*?)</div>',
-                      bruto,
-                      flags=re.IGNORECASE | re.DOTALL,
-                  )
-                  print(f"[Telegram @{canal}] HTTP {status} | {len(blocos)} mensagens recentes.")
-
-                  for bloco_html in blocos[-25:]:
-                      texto_limpo = html.unescape(re.sub(r"<[^>]+>", " ", bloco_html))
-                      if not re.search(r"shopee|shp\.ee", texto_limpo, flags=re.IGNORECASE):
-                          continue
-
-                      links_shopee = re.findall(
-                          r'https?://(?:br\.shp\.ee|s\.shopee\.com\.br|shopee\.com\.br)[^\s"\'<>]+',
-                          html.unescape(bloco_html),
-                          flags=re.IGNORECASE,
-                      )
-                      link_msg = links_shopee[0] if links_shopee else URL_SHOPEE_PADRAO
-                      valor_desc = extrair_desconto_brl(texto_limpo)
-
-                      # Prioridade 1: codigos dentro de <code>...</code> (padrao de bots de cupom no Telegram)
-                      cods_tag = re.findall(r"<code[^>]*>\s*([A-Za-z0-9_-]{4,20})\s*</code>", bloco_html, flags=re.IGNORECASE)
-                      for c in cods_tag:
-                          cod = validar_codigo(c, exigir_digito=False)
-                          if cod:
-                              registrar_cupom(cod, valor_desc, f"Telegram @{canal}", link_msg)
-
-                      # Prioridade 2: mencoes explicitas a cupom no texto
-                      for m in re.finditer(
-                          r"(?:cupom|c[oó]digo)\s*[:\-]?\s*([A-Z0-9_-]{5,20})\b",
-                          texto_limpo,
-                          flags=re.IGNORECASE,
-                      ):
-                          cod = validar_codigo(m.group(1), exigir_digito=True)
-                          if cod:
-                              registrar_cupom(cod, valor_desc, f"Telegram @{canal}", link_msg)
-              except Exception as e:
-                  msg = f"Telegram @{canal}: {e}"
-                  print(f"[erro] {msg}")
-                  falhas.append(msg)
-
-          # 3. Fonte B: Agregadores diretos (Cuponomia, Pelando, Meliuz)
-          fontes_web = {
-              "Cuponomia": "https://www.cuponomia.com.br/desconto/shopee",
-              "Pelando": "https://www.pelando.com.br/cupons-de-descontos/shopee",
-              "Meliuz": "https://www.meliuz.com.br/desconto/cupom-shopee",
-          }
-
-          chaves_alta = {"couponcode", "vouchercode", "promocode", "discountcode", "cupom"}
-          chaves_ctx = {"title", "description", "discount", "store", "merchant", "coupon", "voucher", "offer"}
-
-          def extrair_json_recursivo(obj, out):
-              if isinstance(obj, list):
-                  for it in obj:
-                      extrair_json_recursivo(it, out)
-              elif isinstance(obj, dict):
-                  low = {str(k).lower(): k for k in obj.keys()}
-                  ctx = " ".join(
-                      str(obj[low[k]])
-                      for k in ("title", "name", "description", "text", "discount", "label")
-                      if k in low and isinstance(obj[low[k]], (str, int, float))
-                  )
-                  for chave in chaves_alta:
-                      if chave in low and isinstance(obj[low[chave]], str):
-                          cod = validar_codigo(obj[low[chave]], exigir_digito=False)
-                          if cod:
-                              out.append((cod, ctx))
-                  if "code" in low and (set(low.keys()) & chaves_ctx) and isinstance(obj[low["code"]], str):
-                      cod = validar_codigo(obj[low["code"]], exigir_digito=True)
-                      if cod:
-                          out.append((cod, ctx))
-                  for v in obj.values():
-                      if isinstance(v, (dict, list)):
-                          extrair_json_recursivo(v, out)
-
-          padroes_html = [
-              (r'"(?:couponCode|voucherCode|promoCode|discountCode)"\s*:\s*"([A-Za-z0-9_-]{5,20})"', False),
-              (r'(?:cupom|c[oó]digo)\s*[:\-]?\s*<[^>]+>\s*([A-Z0-9]{5,15})\s*<', True),
-              (r'\b(?:usar?\s+o?\s*cupom|c[oó]digo\s+promocional)\s+([A-Z0-9]{5,15})\b', False),
-          ]
-
-          for nome_fonte, url_fonte in fontes_web.items():
-              try:
-                  status, bruto_html = baixar_texto(url_fonte, timeout=20)
-                  conteudo = html.unescape(bruto_html)
-                  sucessos += 1
-                  print(f"[{nome_fonte}] HTTP {status} | {len(conteudo)} chars.")
-
-                  candidatos = []
-                  for bloco_json in re.findall(
-                      r'<script[^>]*(?:id="__NEXT_DATA__"|type="application/ld\+json")[^>]*>(.*?)</script>',
-                      bruto_html,
-                      flags=re.IGNORECASE | re.DOTALL,
-                  ):
-                      try:
-                          extrair_json_recursivo(json.loads(bloco_json.strip()), candidatos)
-                      except json.JSONDecodeError:
-                          continue
-
-                  for padrao, exigir_dig in padroes_html:
-                      for m in re.finditer(padrao, conteudo, flags=re.IGNORECASE):
-                          cod = validar_codigo(m.group(1), exigir_digito=exigir_dig)
-                          if cod:
-                              trecho = conteudo[max(0, m.start() - 250):min(len(conteudo), m.end() + 250)]
-                              candidatos.append((cod, trecho))
-
-                  for cod, ctx in candidatos:
-                      registrar_cupom(cod, extrair_desconto_brl(ctx), nome_fonte, URL_SHOPEE_PADRAO)
-
-              except urllib.error.HTTPError as e:
-                  msg = f"{nome_fonte}: HTTP {e.code}"
-                  print(f"[erro] {msg}")
-                  falhas.append(msg)
-              except Exception as e:
-                  msg = f"{nome_fonte}: {type(e).__name__}"
-                  print(f"[erro] {msg}")
-                  falhas.append(msg)
-
-          # 4. Salvar memoria e notificar apenas novidades
-          agora_ts = int(time.time())
-          if encontrados:
-              for cod in encontrados:
-                  estado["seen_codes"][cod] = agora_ts
-
-              link_clique = next(
-                  (info["link"] for info in encontrados.values() if info["link"] != URL_SHOPEE_PADRAO),
-                  URL_SHOPEE_PADRAO,
+          def salvar_estado(state_file, estado):
+              vistos = estado.get("seen_vouchers", {})
+              if len(vistos) > 3000:
+                  ordenados = sorted(vistos.items(), key=lambda kv: kv[1], reverse=True)[:3000]
+                  estado["seen_vouchers"] = dict(ordenados)
+              state_file.write_text(
+                  json.dumps(estado, ensure_ascii=False, indent=2),
+                  encoding="utf-8",
               )
-              linhas = []
-              for cod, info in list(encontrados.items())[:15]:
-                  val_txt = f" (ate R$ {info['valor']:g})" if info["valor"] > 0 else ""
-                  linhas.append(f"- {cod}{val_txt} [{info['fonte']}]")
+
+
+          def main():
+              dry_run = os.environ.get("DRY_RUN") == "1"
+              topico_bruto = os.environ.get("NTFY_TOPIC", "").strip()
+              if not topico_bruto and dry_run:
+                  topico_bruto = "shoppe_9176fxdsy"
+              topico = re.sub(r"^https?://ntfy\.sh/", "", topico_bruto, flags=re.IGNORECASE).strip("/")
+              if not topico or "/" in topico or " " in topico:
+                  raise SystemExit("ERRO: Secret NTFY_TOPIC vazio ou invalido.")
+
+              modo_teste = (os.environ.get("MODO_TESTE") or "nao").strip().lower()
+              desconto_str = (os.environ.get("DESCONTO_MIN") or "0").strip()
+              try:
+                  desconto_min = max(0.0, float(desconto_str.replace(",", ".")))
+              except ValueError:
+                  desconto_min = 0.0
+
+              cache_dir = Path(
+                  os.environ.get("STATE_DIR") or (Path.home() / ".cache" / "shopee-monitor")
+              )
+              cache_dir.mkdir(parents=True, exist_ok=True)
+              state_file = cache_dir / "state.json"
+              estado = carregar_estado(state_file)
+              estado.setdefault("seen_vouchers", {})
+
+              url_ativa = resolver_url_oficial(estado.get("active_url") or DEFAULT_ACTIVE_URL)
+              estado["active_url"] = url_ativa
+
+              agora_ts = int(time.time())
+              app_id = os.environ.get("SHOPEE_APP_ID", "").strip()
+              app_secret = os.environ.get("SHOPEE_APP_SECRET", "").strip()
+              api_ativa = bool(app_id and app_secret)
+
+              consolidados = {}
+              api_itens = coletar_shopee_oficial_graphql(app_id, app_secret, agora_ts)
+              consolidados.update(api_itens)
+
+              coletar_cuponomia(consolidados)
+              coletar_thiagorodrigo(consolidados)
+              coletar_meliuz(consolidados)
+
+              extras = [
+                  c.strip()
+                  for c in os.environ.get("SHOPEE_TG_CHANNELS", "").split(",")
+                  if c.strip()
+              ]
+              canais = list(dict.fromkeys(DEFAULT_TG_CHANNELS + extras))
+              coletar_telegram_publico(consolidados, canais, agora_ts)
+
+              vistos = estado["seen_vouchers"]
+              novos = []
+              for chave, item in consolidados.items():
+                  if chave in vistos:
+                      continue
+                  if not estado.get("initialized"):
+                      vistos[chave] = agora_ts
+                  if desconto_min > 0 and item["desconto_reais"] < desconto_min:
+                      continue
+                  novos.append((chave, item))
 
               if not estado.get("initialized"):
                   estado["initialized"] = True
-                  salvar_estado(estado)
+                  for chave, _ in novos:
+                      vistos[chave] = agora_ts
+                  salvar_estado(state_file, estado)
+                  linhas = "\n".join(formatar_item(d) for _, d in novos[:12])
+                  if not linhas:
+                      linhas = "- Nenhum item atendeu ao filtro atual."
                   enviar_ntfy(
-                      f"Monitor Shopee Ativo ({len(encontrados)} cupons)",
-                      "Base inicial registrada (sem cookies):\n"
-                      + "\n".join(linhas)
-                      + "\n\nA partir de agora, voce so recebe alerta quando surgir cupom novo.",
-                      click_url=link_clique,
+                      topico,
+                      f"Monitor Shopee Ativo ({len(novos)} itens mapeados)",
+                      f"URL oficial: {url_ativa}\n"
+                      f"API Oficial Shopee: {'ATIVA' if api_ativa else 'Aguardando Secrets'}\n\n"
+                      f"Amostra atual:\n{linhas}\n\n"
+                      "Proximos pushes serao enviados apenas para cupons/campanhas ineditos.",
+                      click_url=url_ativa,
                       prioridade=3,
                       tags=["white_check_mark", "shopping"],
                   )
-              else:
-                  salvar_estado(estado)
+                  return
+
+              if novos:
+                  for chave, _ in novos:
+                      vistos[chave] = agora_ts
+                  salvar_estado(state_file, estado)
+                  linhas = "\n".join(formatar_item(d) for _, d in novos[:12])
+                  click_dest = next(
+                      (
+                          d.get("link")
+                          for k, d in novos
+                          if k.startswith("SHOPEE_API:") and d.get("link")
+                      ),
+                      url_ativa,
+                  )
                   enviar_ntfy(
-                      f"NOVO Cupom Shopee ({len(encontrados)})!",
-                      "Detectado agora:\n"
-                      + "\n".join(linhas)
-                      + "\n\nToque para abrir os cupons na Shopee.",
-                      click_url=link_clique,
+                      topico,
+                      f"NOVO Cupom Shopee ({len(novos)})!",
+                      f"Detectado agora no monitoramento Shopee:\n{linhas}\n\n"
+                      "Toque para abrir a pagina oficial e resgatar.",
+                      click_url=click_dest,
                       prioridade=5,
                       tags=["rotating_light", "fire", "shopping"],
                   )
-          else:
-              salvar_estado(estado)
-              print(f"[ok] Nenhum cupom inedito. Fontes OK: {sucessos} | Historico: {len(ja_enviados)}")
+                  return
+
+              salvar_estado(state_file, estado)
+              print(f"[ok] {len(consolidados)} itens verificados. Nenhum cupom inedito.")
               if modo_teste == "sim":
-                  resumo_falhas = f"\nAvisos: {'; '.join(falhas)}" if falhas else ""
                   enviar_ntfy(
+                      topico,
                       "Teste Monitor Shopee OK",
-                      f"Fluxo rapido (sem cookies) funcionando.\nFontes lidas: {sucessos}\n"
-                      f"Cupons ja na memoria: {len(ja_enviados)}{resumo_falhas}",
-                      click_url=URL_SHOPEE_PADRAO,
+                      f"URL oficial ativa: {url_ativa}\n"
+                      f"API Oficial Shopee: {'ATIVA' if api_ativa else 'Aguardando Secrets'}\n"
+                      f"Itens ativos monitorados: {len(consolidados)} (nenhum inedito neste ciclo).",
+                      click_url=url_ativa,
                       prioridade=3,
                       tags=["white_check_mark"],
                   )
 
-          if sucessos == 0:
-              raise SystemExit(f"ERRO: Todas as fontes falharam ({'; '.join(falhas)}).")
+
+          if __name__ == "__main__":
+              main()
           EOF
