@@ -46,6 +46,7 @@ jobs:
       - name: Monitorar Shopee oficial e notificar via ntfy
         env:
           NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+          SHOPEE_COOKIES: ${{ secrets.SHOPEE_COOKIES }}
           MODO_TESTE: ${{ inputs.modo_teste }}
           DESCONTO_MIN: ${{ inputs.desconto_minimo_reais }}
         run: |
@@ -61,6 +62,7 @@ jobs:
 
           topico_bruto = os.environ.get("NTFY_TOPIC", "").strip()
           topico = re.sub(r"^https?://ntfy\.sh/", "", topico_bruto, flags=re.IGNORECASE).strip("/")
+          cookies_brutos = os.environ.get("SHOPEE_COOKIES", "").strip()
           modo_teste = (os.environ.get("MODO_TESTE") or "nao").strip().lower()
           desconto_str = (os.environ.get("DESCONTO_MIN") or "0").strip()
 
@@ -72,11 +74,12 @@ jobs:
           if not topico or "/" in topico or " " in topico:
               raise SystemExit("ERRO: Secret NTFY_TOPIC vazio ou invalido.")
 
-          SEED_URL = "https://br.shp.ee/SLB8wX71"
+          SEED_URL = "https://shopee.com.br/m/cupom-de-desconto"
           HUBS_OFICIAIS = [
-              "https://shopee.com.br/m/cupons-diarios",
               "https://shopee.com.br/m/cupom-de-desconto",
+              "https://shopee.com.br/m/cupons-diarios",
               "https://shopee.com.br/m/frete-gratis",
+              "https://shopee.com.br/",
           ]
 
           cache_dir = Path.home() / ".cache" / "shopee-monitor"
@@ -103,6 +106,52 @@ jobs:
                   estado["seen_vouchers"] = dict(ordenados)
               state_file.write_text(json.dumps(estado, ensure_ascii=False, indent=2), encoding="utf-8")
 
+          def parse_cookies_playwright(raw_str):
+              if not raw_str:
+                  return []
+              cookies_pw = []
+              if raw_str.startswith("["):
+                  try:
+                      lista = json.loads(raw_str)
+                      for item in lista:
+                          if not isinstance(item, dict):
+                              continue
+                          nome = str(item.get("name") or "").strip()
+                          valor = str(item.get("value") or "")
+                          if not nome:
+                              continue
+                          cookies_pw.append({
+                              "name": nome,
+                              "value": valor,
+                              "domain": str(item.get("domain") or ".shopee.com.br").strip(),
+                              "path": str(item.get("path") or "/"),
+                              "secure": True,
+                              "httpOnly": bool(item.get("httpOnly", False)),
+                              "sameSite": "Lax",
+                          })
+                      return cookies_pw
+                  except json.JSONDecodeError:
+                      pass
+
+              raw_clean = re.sub(r"^cookie\s*:\s*", "", raw_str, flags=re.IGNORECASE)
+              for parte in raw_clean.split(";"):
+                  parte = parte.strip()
+                  if "=" not in parte:
+                      continue
+                  nome, valor = parte.split("=", 1)
+                  nome = nome.strip()
+                  if not nome:
+                      continue
+                  cookies_pw.append({
+                      "name": nome,
+                      "value": valor.strip(),
+                      "domain": ".shopee.com.br",
+                      "path": "/",
+                      "secure": True,
+                      "sameSite": "Lax",
+                  })
+              return cookies_pw
+
           def enviar_ntfy(titulo, mensagem, click_url, prioridade=4, tags=None):
               payload = {
                   "topic": topico,
@@ -117,7 +166,7 @@ jobs:
                   data=json.dumps(payload).encode("utf-8"),
                   headers={
                       "Content-Type": "application/json; charset=utf-8",
-                      "User-Agent": "github-actions-shopee-live/1.0",
+                      "User-Agent": "github-actions-shopee-live/3.0",
                   },
                   method="POST",
               )
@@ -148,21 +197,24 @@ jobs:
               sinais = {
                   "voucher_code", "promotionid", "promotion_id", "voucher_identifier",
                   "discount_value", "discount_percentage", "min_spend", "percentage_claimed",
+                  "voucher_basic_info", "reward_cap", "reward_percentage",
               }
 
-              if len(chaves & sinais) >= 2:
+              codigo = str(obj.get("voucher_code") or "").strip().upper()
+              tem_codigo_valido = bool(re.fullmatch(r"[A-Z0-9_-]{4,25}", codigo))
+
+              if len(chaves & sinais) >= 2 or tem_codigo_valido:
                   promo_id = obj.get("promotionid") or obj.get("promotion_id")
                   if not promo_id and isinstance(obj.get("voucher_identifier"), dict):
                       promo_id = obj["voucher_identifier"].get("promotion_id")
 
-                  codigo = str(obj.get("voucher_code") or "").strip().upper()
                   pct_usado = obj.get("percentage_claimed")
                   end_time = obj.get("end_time") or obj.get("valid_to") or 0
 
                   esgotado = isinstance(pct_usado, (int, float)) and pct_usado >= 100
                   expirado = isinstance(end_time, (int, float)) and end_time > 0 and end_time < agora_ts
 
-                  if (promo_id or codigo) and not esgotado and not expirado:
+                  if (promo_id or tem_codigo_valido) and not esgotado and not expirado:
                       desc_reais = normalizar_valor(
                           obj.get("discount_value") or obj.get("reward_cap") or obj.get("max_value")
                       )
@@ -182,7 +234,7 @@ jobs:
                       chave = f"PROMO:{promo_id}" if promo_id else f"CODE:{codigo}"
                       coletados[chave] = {
                           "id": str(promo_id or ""),
-                          "codigo": codigo,
+                          "codigo": codigo if tem_codigo_valido else "",
                           "titulo": titulo[:90],
                           "desconto_reais": desc_reais,
                           "desconto_pct": int(desc_pct) if isinstance(desc_pct, (int, float)) else 0,
@@ -201,7 +253,7 @@ jobs:
 
               def on_response(resp):
                   nonlocal bloqueio
-                  if "shopee.com.br/api/" not in resp.url.lower():
+                  if "shopee.com.br/" not in resp.url.lower():
                       return
                   if "json" not in (resp.headers.get("content-type") or "").lower():
                       return
@@ -220,9 +272,24 @@ jobs:
                   status = resp_nav.status if resp_nav else 0
                   page.wait_for_timeout(4500)
 
-                  for _ in range(3):
-                      page.mouse.wheel(0, 900)
+                  for _ in range(4):
+                      page.mouse.wheel(0, 950)
                       page.wait_for_timeout(1200)
+
+                  # Tambem varre JSON embutido direto no HTML da pagina
+                  try:
+                      scripts_json = page.eval_on_selector_all(
+                          'script[type="application/json"]',
+                          "els => els.map(e => e.textContent)",
+                      )
+                      for raw_json in scripts_json:
+                          if raw_json and raw_json.strip().startswith(("{", "[")):
+                              try:
+                                  extrair_cupons(json.loads(raw_json), cupons, agora_ts)
+                              except json.JSONDecodeError:
+                                  pass
+                  except Exception:
+                      pass
 
                   url_final = page.url or url
                   if any(k in url_final.lower() for k in ("/buyer/login", "/verify/captcha", "/verify/traffic")):
@@ -245,7 +312,7 @@ jobs:
                   page.remove_listener("response", on_response)
 
           def descobrir_rota_ativa(page):
-              candidatos = [SEED_URL] + HUBS_OFICIAIS
+              candidatos = list(HUBS_OFICIAIS)
               for rota in candidatos:
                   print(f"[auto-url] Testando rota oficial: {rota}")
                   res = inspecionar_pagina(page, rota)
@@ -264,7 +331,7 @@ jobs:
 
                   for link in links:
                       if any(k in link.lower() for k in ("cupom", "cupons", "voucher", "desconto", "frete")):
-                          if link not in candidatos and len(candidatos) < 10:
+                          if link not in candidatos and len(candidatos) < 12:
                               candidatos.append(link)
               return None, None
 
@@ -284,12 +351,16 @@ jobs:
               return f"- {ident}{info}{titulo}"
 
           estado = carregar_estado()
+          cookies_lista = parse_cookies_playwright(cookies_brutos)
+          print(f"[sessao] Cookies carregados: {len(cookies_lista)}")
+
           chrome_bin = shutil.which("google-chrome") or shutil.which("google-chrome-stable")
 
           with sync_playwright() as p:
               launch_kwargs = {
                   "headless": True,
                   "args": [
+                      "--headless=new",
                       "--no-sandbox",
                       "--disable-dev-shm-usage",
                       "--disable-blink-features=AutomationControlled",
@@ -308,11 +379,26 @@ jobs:
                       "AppleWebKit/537.36 (KHTML, like Gecko) "
                       "Chrome/131.0.0.0 Safari/537.36"
                   ),
+                  extra_http_headers={
+                      "Accept-Language": "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7",
+                      "sec-ch-ua": '"Chromium";v="131", "Not_A Brand";v="24"',
+                      "sec-ch-ua-mobile": "?0",
+                      "sec-ch-ua-platform": '"Windows"',
+                  },
               )
+
+              context.add_init_script("""
+                  Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+                  Object.defineProperty(navigator, 'languages', { get: () => ['pt-BR', 'pt', 'en-US', 'en'] });
+                  window.chrome = { runtime: {} };
+              """)
+
+              if cookies_lista:
+                  context.add_cookies(cookies_lista)
+
               page = context.new_page()
 
               try:
-                  # 1. Verifica sempre o link semente oficial para detectar mudanca imediata de destino
                   res = inspecionar_pagina(page, SEED_URL)
                   url_ativa = estado.get("active_url") or SEED_URL
 
@@ -322,7 +408,6 @@ jobs:
                           url_ativa = res["final_url"]
                           estado["active_url"] = url_ativa
 
-                  # 2. Se o link semente falhou ou veio vazio, tenta a ultima rota ativa e auto-descoberta
                   if not res["bloqueio"] and (not res["cupons"] or res["status"] >= 400):
                       if url_ativa != SEED_URL and url_ativa != res["final_url"]:
                           res_ativa = inspecionar_pagina(page, url_ativa)
@@ -344,7 +429,7 @@ jobs:
                       if modo_teste == "sim" or (agora - estado.get("last_block_alert", 0) > 21600):
                           enviar_ntfy(
                               "Shopee bloqueou acesso do GitHub",
-                              f"Motivo: {res['bloqueio']}\nO IP do servidor temporario da Shopee pediu verificacao.",
+                              f"Motivo: {res['bloqueio']}\nAdicione o Secret SHOPEE_COOKIES para liberar o acesso.",
                               click_url=url_ativa,
                               prioridade=3,
                               tags=["warning"],
